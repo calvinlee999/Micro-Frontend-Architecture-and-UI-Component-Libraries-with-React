@@ -778,6 +778,916 @@ compliance-service ──► compliance-db (PostgreSQL 16 — KYC records, AML c
 notification-service ──► notification-db (PostgreSQL 16 — message logs, templates)
 ```
 
+### 5.0.1 Full-Stack Layer Architecture — All Domains
+
+The ordered layer chain from application bootstrap to E2E test for every domain microservice:
+
+```mermaid
+flowchart TB
+    BOOT["Bootstrap\n@SpringBootApplication\nSpring Cloud Config · Service Registry"]
+
+    subgraph WEB["Web Layer"]
+        C1["AccountController\n@RestController /api/accounts"]
+        C2["PaymentController\n@RestController /api/payments"]
+        C3["TradingController\n@RestController /api/orders"]
+        C4["ComplianceController\n@RestController /api/compliance"]
+        C5["NotificationController\n@RestController /api/notifications"]
+    end
+
+    subgraph BIZ["Business Services"]
+        subgraph FACADE["Business Facade (@Component)"]
+            F1["AccountFacade"]
+            F2["PaymentFacade"]
+            F3["TradingFacade"]
+            F4["ComplianceFacade"]
+            F5["NotificationFacade"]
+        end
+        subgraph SVC["Domain Microservice (@Service @Transactional)"]
+            S1["AccountService"]
+            S2["PaymentService"]
+            S3["TradingService"]
+            S4["ComplianceService"]
+            S5["NotificationService"]
+        end
+    end
+
+    subgraph ORM["Repository — ORM Layer (Spring Data JPA)"]
+        R1["AccountRepo\n+ TransactionRepo\n+ AccountLimitRepo\nJpaRepository + JpaSpecificationExecutor"]
+        R2["PaymentRepo\n+ OutboxEventRepo\nJpaRepository"]
+        R3["OrderRepo + ExecutionRepo\n+ MifidReportRepo\n+ PortfolioRepo\nJpaRepository"]
+        R4["KycRecordRepo + AmlCaseRepo\n+ SarRepo\nJpaRepository"]
+        R5["NotificationTemplateRepo\n+ MessageLogRepo\n+ DeliveryAttemptRepo\nJpaRepository"]
+    end
+
+    subgraph DOMAIN["Domain — JPA Entities (@Entity)"]
+        D1["account-db\nAccount · Transaction · AccountLimit"]
+        D2["payment-db PCI-DSS\nPayment · OutboxEvent"]
+        D3["trading-db MiFID II\nOrder · Execution · MifidReport · Portfolio"]
+        D4["compliance-db\nKycRecord · AmlCase · SAR"]
+        D5["notification-db\nNotificationTemplate · MessageLog · DeliveryAttempt"]
+    end
+
+    subgraph INFRA["Infrastructure"]
+        I1["Docker multi-stage\nDistroless JRE 21\nK8s Deployment + HPA"]
+        I2["PostgreSQL 16\nper-domain pod + PVC"]
+        I3["Redis 7\nauth-service · gateway\nrate-limit · session"]
+        I4["Apache Kafka\nEvent streaming\nTopics per domain"]
+    end
+
+    subgraph E2E["E2E Test Layer"]
+        T1["Unit: JUnit 5 · Mockito · AssertJ"]
+        T2["Integration: @SpringBootTest\n+ Testcontainers (PG · Kafka · Redis)"]
+        T3["Contract: Pact\nConsumer-Driven CDC"]
+        T4["Load: k6 P99 less than 2s\nOWASP ZAP security scan"]
+    end
+
+    BOOT --> WEB
+    WEB --> FACADE
+    FACADE --> SVC
+    SVC --> ORM
+    ORM --> DOMAIN
+    DOMAIN --> INFRA
+    INFRA -.->|"observability"| E2E
+    WEB -.->|"tested by"| E2E
+```
+
+---
+
+### 5.0.2 Account Domain — ORM Class Diagram
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Account {
+        +UUID id
+        +String iban
+        +String currency
+        +BigDecimal balance
+        +AccountStatus status
+        +Long version
+        +LocalDateTime createdAt
+        +LocalDateTime updatedAt
+        +List~Transaction~ transactions
+        +List~AccountLimit~ limits
+        +credit(MonetaryAmount) void
+        +debit(MonetaryAmount) void
+    }
+
+    class Transaction {
+        +UUID id
+        +UUID accountId
+        +BigDecimal amount
+        +String currency
+        +TransactionType type
+        +String reference
+        +LocalDate valueDate
+        +LocalDate bookingDate
+        +LocalDateTime createdAt
+    }
+
+    class AccountLimit {
+        +UUID id
+        +UUID accountId
+        +LimitType limitType
+        +BigDecimal dailyAmount
+        +BigDecimal singleAmount
+        +String currency
+        +LocalDateTime updatedAt
+        +isExceeded(BigDecimal) boolean
+    }
+
+    class MonetaryAmount {
+        <<Embeddable>>
+        +BigDecimal amount
+        +String currency
+    }
+
+    class AccountStatus {
+        <<enumeration>>
+        ACTIVE
+        FROZEN
+        CLOSED
+        PENDING_KYC
+    }
+
+    class TransactionType {
+        <<enumeration>>
+        CREDIT
+        DEBIT
+        FEE
+        INTEREST
+        REVERSAL
+    }
+
+    class LimitType {
+        <<enumeration>>
+        DAILY_TRANSFER
+        SINGLE_PAYMENT
+        DAILY_ATM
+    }
+
+    class AccountRepository {
+        <<interface>>
+        +findByIban(String) Optional~Account~
+        +findByIdAndStatus(UUID, AccountStatus) Optional~Account~
+        +findAllByCustomerId(UUID, Pageable) Page~Account~
+    }
+
+    class TransactionRepository {
+        <<interface>>
+        +findByAccountIdOrderByValueDateDesc(UUID, Pageable) Page~Transaction~
+        +findByAccountIdAndValueDateBetween(UUID, LocalDate, LocalDate) List~Transaction~
+    }
+
+    class AccountService {
+        -AccountRepository accountRepo
+        -TransactionRepository transactionRepo
+        -KafkaTemplate kafkaTemplate
+        +getAccount(UUID) AccountDTO
+        +debitAccount(DebitRequest) TransactionDTO
+        +creditAccount(CreditRequest) TransactionDTO
+        +getStatement(UUID, DateRange) StatementDTO
+    }
+
+    Account "1" --> "0..*" Transaction : contains
+    Account "1" --> "0..*" AccountLimit : governed by
+    Account ..> AccountStatus : status
+    Transaction ..> TransactionType : type
+    Account ..> MonetaryAmount : balance embedded
+    AccountLimit ..> LimitType : limitType
+    AccountRepository ..> Account : manages
+    TransactionRepository ..> Transaction : manages
+    AccountService --> AccountRepository : uses
+    AccountService --> TransactionRepository : uses
+```
+
+**Account Domain — Database Schema (`account-db`)**
+
+| Table | Column | Type | Constraints | Notes |
+|---|---|---|---|---|
+| `account` | `id` | `UUID` | PK NOT NULL | `gen_random_uuid()` default |
+| `account` | `iban` | `VARCHAR(34)` | UNIQUE NOT NULL | ISO 13616 |
+| `account` | `customer_id` | `UUID` | NOT NULL IDX | FK to auth user store |
+| `account` | `currency` | `CHAR(3)` | NOT NULL | ISO 4217 |
+| `account` | `balance` | `NUMERIC(19,4)` | NOT NULL DEFAULT 0 | Precision for micro-amounts |
+| `account` | `status` | `VARCHAR(20)` | NOT NULL | enum string |
+| `account` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `account` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Audit |
+| `account` | `updated_at` | `TIMESTAMPTZ` | NOT NULL | Auto-updated trigger |
+| `transaction` | `id` | `UUID` | PK NOT NULL | |
+| `transaction` | `account_id` | `UUID` | NOT NULL FK(account.id) IDX | Cascade on delete restrict |
+| `transaction` | `amount` | `NUMERIC(19,4)` | NOT NULL | Signed: negative = debit |
+| `transaction` | `currency` | `CHAR(3)` | NOT NULL | |
+| `transaction` | `type` | `VARCHAR(20)` | NOT NULL | enum string |
+| `transaction` | `reference` | `VARCHAR(255)` | | End-to-end reference |
+| `transaction` | `value_date` | `DATE` | NOT NULL IDX | Statement date |
+| `transaction` | `booking_date` | `DATE` | NOT NULL | |
+| `transaction` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Immutable after insert |
+| `account_limit` | `id` | `UUID` | PK NOT NULL | |
+| `account_limit` | `account_id` | `UUID` | NOT NULL FK(account.id) IDX | |
+| `account_limit` | `limit_type` | `VARCHAR(30)` | NOT NULL | enum string |
+| `account_limit` | `daily_amount` | `NUMERIC(19,4)` | NOT NULL | |
+| `account_limit` | `single_amount` | `NUMERIC(19,4)` | NOT NULL | |
+| `account_limit` | `currency` | `CHAR(3)` | NOT NULL | |
+| `account_limit` | `updated_at` | `TIMESTAMPTZ` | NOT NULL | |
+
+**Indexes:** `account(customer_id)`, `account(iban)`, `transaction(account_id, value_date DESC)`, `account_limit(account_id, limit_type)`
+
+---
+
+### 5.0.3 Payment Domain — ORM Class Diagram (PCI-DSS Scope)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Payment {
+        +UUID id
+        +String idempotencyKey
+        +UUID customerId
+        +BigDecimal amount
+        +String currency
+        +String cardToken
+        +String maskedPan
+        +String merchantId
+        +PaymentStatus status
+        +Long version
+        +LocalDateTime createdAt
+        +LocalDateTime updatedAt
+        +List~OutboxEvent~ outboxEvents
+        +transitionTo(PaymentStatus) void
+        +isTerminal() boolean
+    }
+
+    class OutboxEvent {
+        +UUID id
+        +UUID aggregateId
+        +String aggregateType
+        +String eventType
+        +String payload
+        +boolean published
+        +LocalDateTime createdAt
+        +LocalDateTime publishedAt
+    }
+
+    class PaymentStatus {
+        <<enumeration>>
+        CREATED
+        FRAUD_CHECK
+        SCA_REQUIRED
+        AUTHORISED
+        SETTLED
+        REJECTED
+        FAILED
+        CANCELLED
+        REVERSED
+    }
+
+    class PaymentRepository {
+        <<interface>>
+        +findByIdempotencyKey(String) Optional~Payment~
+        +findByCustomerIdOrderByCreatedAtDesc(UUID, Pageable) Page~Payment~
+        +findByStatusIn(List~PaymentStatus~, Pageable) Page~Payment~
+    }
+
+    class OutboxEventRepository {
+        <<interface>>
+        +findByPublishedFalseOrderByCreatedAtAsc(Pageable) List~OutboxEvent~
+    }
+
+    class PaymentService {
+        -PaymentRepository paymentRepo
+        -OutboxEventRepository outboxRepo
+        -CardTokenisationService cardTokenService
+        -FraudPreCheckService fraudService
+        +initiatePayment(InitiatePaymentRequest) PaymentDTO
+        +authorisePayment(UUID, SCAToken) PaymentDTO
+        +refundPayment(UUID, RefundRequest) PaymentDTO
+        +getPaymentStatus(UUID) PaymentStatusDTO
+    }
+
+    class OutboxRelay {
+        -OutboxEventRepository outboxRepo
+        -KafkaTemplate kafkaTemplate
+        +relayPendingEvents() void
+    }
+
+    Payment "1" --> "0..*" OutboxEvent : produces
+    Payment ..> PaymentStatus : status
+    PaymentRepository ..> Payment : manages
+    OutboxEventRepository ..> OutboxEvent : manages
+    PaymentService --> PaymentRepository : uses
+    PaymentService --> OutboxEventRepository : uses
+    OutboxRelay --> OutboxEventRepository : polls
+```
+
+**Payment Domain — Database Schema (`payment-db`, PCI-DSS Level 1)**
+
+| Table | Column | Type | Constraints | Notes |
+|---|---|---|---|---|
+| `payment` | `id` | `UUID` | PK NOT NULL | |
+| `payment` | `idempotency_key` | `VARCHAR(128)` | UNIQUE NOT NULL IDX | Duplicate-request guard |
+| `payment` | `customer_id` | `UUID` | NOT NULL IDX | |
+| `payment` | `amount` | `NUMERIC(19,4)` | NOT NULL | |
+| `payment` | `currency` | `CHAR(3)` | NOT NULL | ISO 4217 |
+| `payment` | `card_token` | `VARCHAR(255)` | NOT NULL | Tokenised PAN — PCI-DSS scope |
+| `payment` | `masked_pan` | `VARCHAR(19)` | NOT NULL | Display: first 6 + last 4 |
+| `payment` | `merchant_id` | `VARCHAR(100)` | IDX | |
+| `payment` | `status` | `VARCHAR(20)` | NOT NULL IDX | enum string |
+| `payment` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `payment` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | Audit trail |
+| `payment` | `updated_at` | `TIMESTAMPTZ` | NOT NULL | PCI-DSS: immutable once SETTLED |
+| `outbox_event` | `id` | `UUID` | PK NOT NULL | |
+| `outbox_event` | `aggregate_id` | `UUID` | NOT NULL IDX | |
+| `outbox_event` | `aggregate_type` | `VARCHAR(100)` | NOT NULL | e.g. `Payment` |
+| `outbox_event` | `event_type` | `VARCHAR(100)` | NOT NULL | e.g. `payment.initiated` |
+| `outbox_event` | `payload` | `JSONB` | NOT NULL | Event body |
+| `outbox_event` | `published` | `BOOLEAN` | NOT NULL DEFAULT false IDX | Relay query predicate |
+| `outbox_event` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `outbox_event` | `published_at` | `TIMESTAMPTZ` | | Set by OutboxRelay |
+
+**Indexes:** `payment(idempotency_key)`, `payment(customer_id, created_at DESC)`, `payment(status)`, `outbox_event(published, created_at)` where `published = false` (partial index)
+
+**PCI-DSS controls:** Card token stored via Vault Transit Encryption. Raw PAN never persisted. `payment-db` runs in a dedicated Kubernetes namespace with NetworkPolicy restricting ingress to payment-service pods only.
+
+---
+
+### 5.0.4 Trading Domain — ORM Class Diagram (MiFID II Scope)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Order {
+        +UUID id
+        +UUID customerId
+        +String instrument
+        +OrderSide side
+        +BigDecimal quantity
+        +BigDecimal limitPrice
+        +OrderStatus status
+        +Long version
+        +LocalDateTime placedAt
+        +LocalDateTime updatedAt
+        +List~Execution~ executions
+        +List~MifidReport~ mifidReports
+        +fill(Execution) void
+        +cancel() void
+        +isFilled() boolean
+    }
+
+    class Execution {
+        +UUID id
+        +UUID orderId
+        +BigDecimal executedQuantity
+        +BigDecimal executedPrice
+        +String venue
+        +LocalDateTime executedAt
+        +String tradeReference
+    }
+
+    class MifidReport {
+        +UUID id
+        +UUID orderId
+        +MifidReportType reportType
+        +String regulatoryBody
+        +String reportPayload
+        +LocalDateTime reportedAt
+        +MifidReportStatus reportStatus
+    }
+
+    class Portfolio {
+        +UUID customerId
+        +String instrumentId
+        +BigDecimal quantity
+        +BigDecimal averageCost
+        +BigDecimal marketValue
+        +Long version
+        +LocalDateTime lastUpdated
+        +applyExecution(Execution) void
+    }
+
+    class OrderSide {
+        <<enumeration>>
+        BUY
+        SELL
+        BUY_TO_COVER
+        SELL_SHORT
+    }
+
+    class OrderStatus {
+        <<enumeration>>
+        NEW
+        PARTIALLY_FILLED
+        FILLED
+        CANCELLED
+        REJECTED
+        EXPIRED
+    }
+
+    class MifidReportType {
+        <<enumeration>>
+        TRANSACTION_REPORT
+        ORDER_RECORD
+        BEST_EXECUTION
+    }
+
+    class OrderRepository {
+        <<interface>>
+        +findByCustomerIdAndStatusIn(UUID, List~OrderStatus~, Pageable) Page~Order~
+        +findByInstrumentAndStatus(String, OrderStatus) List~Order~
+    }
+
+    class PortfolioRepository {
+        <<interface>>
+        +findByCustomerId(UUID) List~Portfolio~
+        +findByCustomerIdAndInstrumentId(UUID, String) Optional~Portfolio~
+    }
+
+    class TradingService {
+        -OrderRepository orderRepo
+        -ExecutionRepository executionRepo
+        -PortfolioRepository portfolioRepo
+        -MifidReportRepository mifidRepo
+        -KafkaTemplate kafkaTemplate
+        +placeOrder(PlaceOrderRequest) OrderDTO
+        +cancelOrder(UUID) OrderDTO
+        +recordExecution(ExecutionEvent) void
+        +getPortfolio(UUID) PortfolioDTO
+    }
+
+    Order "1" --> "0..*" Execution : filled by
+    Order "1" --> "0..*" MifidReport : reported as
+    Order ..> OrderSide : side
+    Order ..> OrderStatus : status
+    MifidReport ..> MifidReportType : reportType
+    Portfolio ..> Order : updated from
+    OrderRepository ..> Order : manages
+    PortfolioRepository ..> Portfolio : manages
+    TradingService --> OrderRepository : uses
+    TradingService --> PortfolioRepository : uses
+```
+
+**Trading Domain — Database Schema (`trading-db`, MiFID II 7-year retention)**
+
+| Table | Column | Type | Constraints | Notes |
+|---|---|---|---|---|
+| `trade_order` | `id` | `UUID` | PK NOT NULL | |
+| `trade_order` | `customer_id` | `UUID` | NOT NULL IDX | |
+| `trade_order` | `instrument` | `VARCHAR(20)` | NOT NULL IDX | ISIN or ticker |
+| `trade_order` | `side` | `VARCHAR(20)` | NOT NULL | enum string |
+| `trade_order` | `quantity` | `NUMERIC(19,8)` | NOT NULL | Fractional shares |
+| `trade_order` | `limit_price` | `NUMERIC(19,8)` | | NULL = market order |
+| `trade_order` | `status` | `VARCHAR(20)` | NOT NULL IDX | enum string |
+| `trade_order` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `trade_order` | `placed_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() IDX | MiFID II audit |
+| `trade_order` | `updated_at` | `TIMESTAMPTZ` | NOT NULL | |
+| `trade_execution` | `id` | `UUID` | PK NOT NULL | Immutable after insert |
+| `trade_execution` | `order_id` | `UUID` | NOT NULL FK(trade_order.id) IDX | |
+| `trade_execution` | `executed_quantity` | `NUMERIC(19,8)` | NOT NULL | |
+| `trade_execution` | `executed_price` | `NUMERIC(19,8)` | NOT NULL | |
+| `trade_execution` | `venue` | `VARCHAR(50)` | NOT NULL | MIC code |
+| `trade_execution` | `executed_at` | `TIMESTAMPTZ` | NOT NULL | Nanosecond precision preferred |
+| `trade_execution` | `trade_reference` | `VARCHAR(100)` | UNIQUE | Exchange reference |
+| `mifid_transaction_report` | `id` | `UUID` | PK NOT NULL | |
+| `mifid_transaction_report` | `order_id` | `UUID` | NOT NULL FK IDX | |
+| `mifid_transaction_report` | `report_type` | `VARCHAR(30)` | NOT NULL | enum string |
+| `mifid_transaction_report` | `regulatory_body` | `VARCHAR(100)` | NOT NULL | e.g. FCA, ESMA |
+| `mifid_transaction_report` | `report_payload` | `JSONB` | NOT NULL | Full RTS 22 fields |
+| `mifid_transaction_report` | `reported_at` | `TIMESTAMPTZ` | NOT NULL IDX | |
+| `mifid_transaction_report` | `report_status` | `VARCHAR(20)` | NOT NULL | PENDING / SUBMITTED / ACCEPTED |
+| `portfolio` | `customer_id` | `UUID` | PK (composite) NOT NULL | |
+| `portfolio` | `instrument_id` | `VARCHAR(20)` | PK (composite) NOT NULL | ISIN |
+| `portfolio` | `quantity` | `NUMERIC(19,8)` | NOT NULL DEFAULT 0 | |
+| `portfolio` | `average_cost` | `NUMERIC(19,8)` | NOT NULL DEFAULT 0 | VWAP |
+| `portfolio` | `market_value` | `NUMERIC(19,4)` | | Refreshed async |
+| `portfolio` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `portfolio` | `last_updated` | `TIMESTAMPTZ` | NOT NULL | |
+
+**Indexes:** `trade_order(customer_id, placed_at DESC)`, `trade_order(instrument, status)`, `trade_execution(order_id)`, `mifid_transaction_report(reported_at)`, `portfolio(customer_id)`
+
+**MiFID II controls:** All trade records retained for 7 years (RTS 24). `mifid_transaction_report` table is append-only enforced via PostgreSQL Row Security Policy and application-level `@Immutable` guard.
+
+---
+
+### 5.0.5 Compliance Domain — ORM Class Diagram (KYC/AML)
+
+```mermaid
+classDiagram
+    direction TB
+
+    class KycRecord {
+        +UUID id
+        +UUID customerId
+        +KycStatus status
+        +KycTier tier
+        +String documentType
+        +String documentRef
+        +LocalDate expiryDate
+        +String reviewedBy
+        +LocalDateTime reviewedAt
+        +LocalDateTime createdAt
+        +Long version
+        +approve(String reviewer) void
+        +reject(String reason) void
+        +escalate() void
+    }
+
+    class AmlCase {
+        +UUID id
+        +UUID customerId
+        +UUID triggeredByPaymentId
+        +AmlCaseStatus status
+        +AmlRiskLevel riskLevel
+        +String ruleTriggered
+        +String analystNotes
+        +LocalDateTime openedAt
+        +LocalDateTime closedAt
+        +Long version
+        +List~SuspiciousActivityReport~ sars
+        +close(String resolution) void
+        +fileSar() SuspiciousActivityReport
+    }
+
+    class SuspiciousActivityReport {
+        +UUID id
+        +UUID caseId
+        +SarStatus status
+        +String narrativeText
+        +String fiuReference
+        +LocalDateTime submittedAt
+        +LocalDateTime acknowledgedAt
+    }
+
+    class KycStatus {
+        <<enumeration>>
+        PENDING
+        IN_REVIEW
+        APPROVED
+        REJECTED
+        EXPIRED
+        ESCALATED
+    }
+
+    class KycTier {
+        <<enumeration>>
+        BASIC
+        STANDARD
+        ENHANCED
+        PEP
+    }
+
+    class AmlCaseStatus {
+        <<enumeration>>
+        OPEN
+        UNDER_REVIEW
+        ESCALATED
+        CLOSED_CLEAR
+        CLOSED_SAR_FILED
+    }
+
+    class AmlRiskLevel {
+        <<enumeration>>
+        LOW
+        MEDIUM
+        HIGH
+        CRITICAL
+    }
+
+    class SarStatus {
+        <<enumeration>>
+        DRAFT
+        SUBMITTED
+        ACKNOWLEDGED
+        REJECTED_FIU
+    }
+
+    class KycRecordRepository {
+        <<interface>>
+        +findByCustomerId(UUID) Optional~KycRecord~
+        +findByStatusAndExpiryDateBefore(KycStatus, LocalDate) List~KycRecord~
+    }
+
+    class AmlCaseRepository {
+        <<interface>>
+        +findByCustomerIdAndStatusIn(UUID, List~AmlCaseStatus~) List~AmlCase~
+        +findByRiskLevelAndStatus(AmlRiskLevel, AmlCaseStatus, Pageable) Page~AmlCase~
+    }
+
+    class ComplianceService {
+        -KycRecordRepository kycRepo
+        -AmlCaseRepository amlRepo
+        -SarRepository sarRepo
+        -KafkaTemplate kafkaTemplate
+        +processKycVerification(KycCommand) KycDTO
+        +processAmlAlert(AmlAlertEvent) AmlCaseDTO
+        +fileReport(UUID) SarDTO
+        +getCustomerRiskProfile(UUID) RiskProfileDTO
+    }
+
+    KycRecord ..> KycStatus : status
+    KycRecord ..> KycTier : tier
+    AmlCase "1" --> "0..*" SuspiciousActivityReport : may generate
+    AmlCase ..> AmlCaseStatus : status
+    AmlCase ..> AmlRiskLevel : riskLevel
+    SuspiciousActivityReport ..> SarStatus : status
+    KycRecordRepository ..> KycRecord : manages
+    AmlCaseRepository ..> AmlCase : manages
+    ComplianceService --> KycRecordRepository : uses
+    ComplianceService --> AmlCaseRepository : uses
+```
+
+**Compliance Domain — Database Schema (`compliance-db`)**
+
+| Table | Column | Type | Constraints | Notes |
+|---|---|---|---|---|
+| `kyc_record` | `id` | `UUID` | PK NOT NULL | |
+| `kyc_record` | `customer_id` | `UUID` | UNIQUE NOT NULL IDX | One active KYC per customer |
+| `kyc_record` | `status` | `VARCHAR(20)` | NOT NULL IDX | enum string |
+| `kyc_record` | `tier` | `VARCHAR(20)` | NOT NULL | BASIC / STANDARD / ENHANCED / PEP |
+| `kyc_record` | `document_type` | `VARCHAR(50)` | NOT NULL | PASSPORT / DRIVING_LICENCE / etc. |
+| `kyc_record` | `document_ref` | `VARCHAR(100)` | | Encrypted reference |
+| `kyc_record` | `expiry_date` | `DATE` | IDX | Document expiry |
+| `kyc_record` | `reviewed_by` | `VARCHAR(100)` | | Compliance analyst ID |
+| `kyc_record` | `reviewed_at` | `TIMESTAMPTZ` | | |
+| `kyc_record` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `kyc_record` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `aml_case` | `id` | `UUID` | PK NOT NULL | |
+| `aml_case` | `customer_id` | `UUID` | NOT NULL IDX | |
+| `aml_case` | `triggered_by_payment_id` | `UUID` | IDX | Source payment |
+| `aml_case` | `status` | `VARCHAR(30)` | NOT NULL IDX | enum string |
+| `aml_case` | `risk_level` | `VARCHAR(20)` | NOT NULL IDX | enum string |
+| `aml_case` | `rule_triggered` | `VARCHAR(200)` | NOT NULL | Rule engine rule name |
+| `aml_case` | `analyst_notes` | `TEXT` | | Encrypted at rest |
+| `aml_case` | `opened_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() IDX | |
+| `aml_case` | `closed_at` | `TIMESTAMPTZ` | | |
+| `aml_case` | `version` | `BIGINT` | NOT NULL DEFAULT 0 | Optimistic lock |
+| `suspicious_activity_report` | `id` | `UUID` | PK NOT NULL | |
+| `suspicious_activity_report` | `case_id` | `UUID` | NOT NULL FK(aml_case.id) IDX | |
+| `suspicious_activity_report` | `status` | `VARCHAR(30)` | NOT NULL | enum string |
+| `suspicious_activity_report` | `narrative_text` | `TEXT` | NOT NULL | Encrypted at rest (SOC 2) |
+| `suspicious_activity_report` | `fiu_reference` | `VARCHAR(100)` | UNIQUE | FIU/NCA assigned ref |
+| `suspicious_activity_report` | `submitted_at` | `TIMESTAMPTZ` | IDX | |
+| `suspicious_activity_report` | `acknowledged_at` | `TIMESTAMPTZ` | | |
+
+**Indexes:** `kyc_record(customer_id)`, `kyc_record(status, expiry_date)`, `aml_case(customer_id, status)`, `aml_case(risk_level, status)`, `suspicious_activity_report(case_id)`
+
+**Compliance controls:** `analyst_notes` and `narrative_text` encrypted at rest using PostgreSQL `pgcrypto`. All compliance tables subject to 7-year data retention policy (MLRO regulatory requirement). Row-level audit triggers log all `UPDATE`/`DELETE` to `compliance_audit_log` table.
+
+---
+
+### 5.0.6 Notification Domain — ORM Class Diagram
+
+```mermaid
+classDiagram
+    direction TB
+
+    class NotificationTemplate {
+        +UUID id
+        +String templateCode
+        +NotificationChannel channel
+        +String locale
+        +String subject
+        +String bodyTemplate
+        +boolean active
+        +int version
+        +LocalDateTime createdAt
+        +render(Map params) String
+    }
+
+    class MessageLog {
+        +UUID id
+        +UUID customerId
+        +UUID correlationId
+        +String templateCode
+        +NotificationChannel channel
+        +String recipient
+        +MessageStatus status
+        +int attemptCount
+        +LocalDateTime scheduledAt
+        +LocalDateTime sentAt
+        +LocalDateTime createdAt
+        +List~DeliveryAttempt~ attempts
+        +markSent() void
+        +markFailed(String reason) void
+        +isRetryable() boolean
+    }
+
+    class DeliveryAttempt {
+        +UUID id
+        +UUID messageLogId
+        +int attemptNumber
+        +DeliveryResult result
+        +String providerResponse
+        +String errorCode
+        +LocalDateTime attemptedAt
+        +long durationMs
+    }
+
+    class NotificationChannel {
+        <<enumeration>>
+        EMAIL
+        SMS
+        PUSH
+        IN_APP
+        WEBHOOK
+    }
+
+    class MessageStatus {
+        <<enumeration>>
+        PENDING
+        SENT
+        DELIVERED
+        FAILED
+        BOUNCED
+        SUPPRESSED
+    }
+
+    class DeliveryResult {
+        <<enumeration>>
+        SUCCESS
+        PROVIDER_ERROR
+        INVALID_RECIPIENT
+        RATE_LIMITED
+        TIMEOUT
+    }
+
+    class NotificationTemplateRepository {
+        <<interface>>
+        +findByTemplateCodeAndChannelAndLocale(String, NotificationChannel, String) Optional~NotificationTemplate~
+        +findByActiveTrue() List~NotificationTemplate~
+    }
+
+    class MessageLogRepository {
+        <<interface>>
+        +findByStatusAndScheduledAtBefore(MessageStatus, LocalDateTime, Pageable) Page~MessageLog~
+        +findByCustomerIdOrderByCreatedAtDesc(UUID, Pageable) Page~MessageLog~
+        +countByCustomerIdAndStatusAndCreatedAtAfter(UUID, MessageStatus, LocalDateTime) long
+    }
+
+    class NotificationService {
+        -NotificationTemplateRepository templateRepo
+        -MessageLogRepository messageLogRepo
+        -EmailProvider emailProvider
+        -SmsProvider smsProvider
+        -PushProvider pushProvider
+        -KafkaTemplate kafkaTemplate
+        +sendNotification(NotificationCommand) MessageLogDTO
+        +retryFailed() void
+        +getDeliveryStatus(UUID) DeliveryStatusDTO
+    }
+
+    NotificationTemplate ..> NotificationChannel : channel
+    MessageLog "1" --> "0..*" DeliveryAttempt : tracked by
+    MessageLog ..> MessageStatus : status
+    MessageLog ..> NotificationChannel : channel
+    DeliveryAttempt ..> DeliveryResult : result
+    NotificationTemplateRepository ..> NotificationTemplate : manages
+    MessageLogRepository ..> MessageLog : manages
+    NotificationService --> NotificationTemplateRepository : uses
+    NotificationService --> MessageLogRepository : uses
+```
+
+**Notification Domain — Database Schema (`notification-db`)**
+
+| Table | Column | Type | Constraints | Notes |
+|---|---|---|---|---|
+| `notification_template` | `id` | `UUID` | PK NOT NULL | |
+| `notification_template` | `template_code` | `VARCHAR(100)` | NOT NULL IDX | e.g. `PAYMENT_CONFIRMED` |
+| `notification_template` | `channel` | `VARCHAR(20)` | NOT NULL | enum string |
+| `notification_template` | `locale` | `VARCHAR(10)` | NOT NULL | BCP 47 e.g. `en-GB` |
+| `notification_template` | `subject` | `VARCHAR(255)` | | Email subject |
+| `notification_template` | `body_template` | `TEXT` | NOT NULL | Handlebars template |
+| `notification_template` | `active` | `BOOLEAN` | NOT NULL DEFAULT true | |
+| `notification_template` | `version` | `INT` | NOT NULL DEFAULT 1 | Template version |
+| `notification_template` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `message_log` | `id` | `UUID` | PK NOT NULL | |
+| `message_log` | `customer_id` | `UUID` | NOT NULL IDX | |
+| `message_log` | `correlation_id` | `UUID` | NOT NULL IDX | Links to source event |
+| `message_log` | `template_code` | `VARCHAR(100)` | NOT NULL | |
+| `message_log` | `channel` | `VARCHAR(20)` | NOT NULL | enum string |
+| `message_log` | `recipient` | `VARCHAR(255)` | NOT NULL | Masked: `j***@example.com` |
+| `message_log` | `status` | `VARCHAR(20)` | NOT NULL IDX | enum string |
+| `message_log` | `attempt_count` | `INT` | NOT NULL DEFAULT 0 | Max 3 retries |
+| `message_log` | `scheduled_at` | `TIMESTAMPTZ` | NOT NULL IDX | Retry scheduler query |
+| `message_log` | `sent_at` | `TIMESTAMPTZ` | | |
+| `message_log` | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | |
+| `delivery_attempt` | `id` | `UUID` | PK NOT NULL | |
+| `delivery_attempt` | `message_log_id` | `UUID` | NOT NULL FK(message_log.id) IDX | |
+| `delivery_attempt` | `attempt_number` | `INT` | NOT NULL | 1-based |
+| `delivery_attempt` | `result` | `VARCHAR(30)` | NOT NULL | enum string |
+| `delivery_attempt` | `provider_response` | `TEXT` | | Raw provider JSON |
+| `delivery_attempt` | `error_code` | `VARCHAR(50)` | | Provider error code |
+| `delivery_attempt` | `attempted_at` | `TIMESTAMPTZ` | NOT NULL IDX | |
+| `delivery_attempt` | `duration_ms` | `BIGINT` | NOT NULL | Provider latency |
+
+**Indexes:** `notification_template(template_code, channel, locale)` UNIQUE, `message_log(status, scheduled_at)` where `status IN ('PENDING','FAILED')` (partial), `message_log(customer_id, created_at DESC)`, `delivery_attempt(message_log_id)`
+
+---
+
+### 5.0.7 JPA Entity Code Patterns — Reference Implementation
+
+The following patterns are applied consistently across all five domain `@Entity` classes:
+
+```java
+// Account.java — reference @Entity with ORM annotations
+@Entity
+@Table(name = "account",
+       indexes = {
+           @Index(name = "idx_account_customer_id", columnList = "customer_id"),
+           @Index(name = "idx_account_iban",        columnList = "iban", unique = true)
+       })
+@EntityListeners(AuditingEntityListener.class)
+public class Account {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    @Column(name = "id", nullable = false, updatable = false)
+    private UUID id;
+
+    @Column(name = "iban", nullable = false, unique = true, length = 34)
+    private String iban;
+
+    @Column(name = "customer_id", nullable = false)
+    private UUID customerId;
+
+    @Embedded
+    private MonetaryAmount balance;        // @Embeddable — amount + currency columns
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false, length = 20)
+    private AccountStatus status;
+
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
+
+    @CreatedDate
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+
+    @OneToMany(mappedBy = "account", cascade = CascadeType.ALL,
+               fetch = FetchType.LAZY, orphanRemoval = true)
+    @OrderBy("valueDate DESC")
+    private List<Transaction> transactions = new ArrayList<>();
+
+    @OneToMany(mappedBy = "account", cascade = CascadeType.ALL,
+               fetch = FetchType.LAZY)
+    private List<AccountLimit> limits = new ArrayList<>();
+
+    // Domain method — guards debit with limit check
+    public void debit(MonetaryAmount amount) {
+        limits.stream()
+              .filter(l -> l.getLimitType() == LimitType.SINGLE_PAYMENT)
+              .findFirst()
+              .ifPresent(l -> l.validate(amount));
+        this.balance = this.balance.subtract(amount);
+    }
+}
+
+// MonetaryAmount.java — @Embeddable value object
+@Embeddable
+public class MonetaryAmount {
+
+    @Column(name = "amount", precision = 19, scale = 4, nullable = false)
+    private BigDecimal amount;
+
+    @Column(name = "currency", length = 3, nullable = false)
+    private String currency;
+
+    public MonetaryAmount subtract(MonetaryAmount other) {
+        if (!this.currency.equals(other.currency))
+            throw new CurrencyMismatchException(this.currency, other.currency);
+        return new MonetaryAmount(this.amount.subtract(other.amount), this.currency);
+    }
+}
+
+// AccountRepository.java — Spring Data JPA interface
+public interface AccountRepository
+        extends JpaRepository<Account, UUID>,
+                JpaSpecificationExecutor<Account> {
+
+    Optional<Account> findByIban(String iban);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT a FROM Account a WHERE a.id = :id")
+    Optional<Account> findByIdForUpdate(@Param("id") UUID id);
+
+    @Query("""
+           SELECT a FROM Account a
+           WHERE a.customerId = :customerId
+             AND a.status = 'ACTIVE'
+           ORDER BY a.createdAt DESC
+           """)
+    Page<Account> findActiveByCustomerId(@Param("customerId") UUID customerId, Pageable pageable);
+}
+```
+
 ### 5.1 Schema Migration — Liquibase
 
 ```yaml
