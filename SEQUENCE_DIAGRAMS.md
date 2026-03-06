@@ -47,7 +47,7 @@ sequenceDiagram
     participant Nav as GlobalNavbar
 
     User->>Entry: GET https://app.fintechbank.com (page load)
-    Note over Entry: index.ts: import("./bootstrap")<br/>async boundary — MF runtime gets event-loop tick
+    Note over Entry: index.ts — async boundary via import("./bootstrap") gives MF runtime an event-loop tick
 
     Entry->>MFRuntime: initContainerAsync()
     activate MFRuntime
@@ -67,14 +67,14 @@ sequenceDiagram
     activate AuthProvider
     AuthProvider->>AuthProvider: access_token = null — no session in memory
     AuthProvider->>IdP: redirect to /authorize?response_type=code&code_challenge=...
-    Note over AuthProvider,IdP: PKCE: code_verifier generated in JS<br/>code_challenge = BASE64URL(SHA-256(code_verifier))
+    Note over AuthProvider,IdP: PKCE — code_verifier generated in JS; code_challenge = BASE64URL(SHA-256(code_verifier))
 
     User->>IdP: enters username + password + TOTP
     IdP-->>AuthProvider: redirect back to /callback?code=AUTH_CODE
 
     AuthProvider->>IdP: POST /token { code, code_verifier, client_id }
     IdP-->>AuthProvider: { access_token (15 min TTL), id_token, set-cookie: refresh_token (httpOnly) }
-    Note over AuthProvider,IdP: access_token → stored in memory ONLY (never localStorage)<br/>refresh_token → httpOnly SameSite=Strict cookie (invisible to JS)
+    Note over AuthProvider,IdP: access_token in memory only (never localStorage); refresh_token = httpOnly SameSite=Strict cookie
 
     AuthProvider->>AuthCtx: setAuthState({ user, access_token, roles: ["customer"] })
     deactivate AuthProvider
@@ -302,7 +302,7 @@ sequenceDiagram
     activate PaymentsMFE
     PaymentsMFE->>PaymentsMFE: import { CurrencyInput } from "@fintechbank/design-system"
     PaymentsMFE->>PaymentsMFE: webpack build — tree-shake design-system bundle
-    Note over PaymentsMFE: Only CurrencyInput + its dependency atoms are included<br/>Unused organisms (KYCDocumentCard) are tree-shaken out
+    Note over PaymentsMFE: CurrencyInput included; KYCDocumentCard tree-shaken (unused organism)
     PaymentsMFE-->>PaymentsTeam: build complete — new remoteEntry.js deployed
     deactivate PaymentsMFE
 
@@ -358,7 +358,7 @@ sequenceDiagram
 
     PaymentsApp->>PaymentsApp: render <PCIFrame src="https://pci.fintechbank.com/capture" />
     activate PCIFrame
-    Note over PaymentsApp,PCIFrame: iframe origin ≠ app origin<br/>JS in PaymentsApp cannot inspect iframe DOM<br/>Card data never enters PaymentsApp heap
+    Note over PaymentsApp,PCIFrame: Cross-origin iframe — JS cannot inspect DOM; card data never enters app heap
 
     PaymentsApp-->>User: PCI card capture form visible inside iframe
 
@@ -432,10 +432,10 @@ sequenceDiagram
     participant CryptoForm as <CryptoOrderForm>
     actor ComplianceOfficer as Compliance Officer (LaunchDarkly dashboard)
 
-    Note over FlagClient,LDEdge: Flag client initialised in Shell bootstrap<br/>with user { userId, roles, segment: "beta" }
+    Note over FlagClient,LDEdge: Flag client initialised in Shell bootstrap with user context (userId, roles, segment)
 
     FlagClient->>LDEdge: SSE streaming connection established (persistent)
-    LDEdge-->>FlagClient: initial flag payload:<br/>  trading.options_chain.enabled = true (segment: beta)<br/>  trading.crypto_pairs.enabled  = false (all users)
+    LDEdge-->>FlagClient: flags — options_chain.enabled=true (beta), crypto_pairs.enabled=false (all users)
 
     User->>TradingApp: navigates to /trading
     TradingApp->>OrderPanel: render <OrderPanel instrument="AAPL" />
@@ -449,12 +449,12 @@ sequenceDiagram
 
     OrderPanel->>EquityForm: render <EquityOrderForm /> (always shown)
     OrderPanel->>OptionsChain: render <OptionsChain /> (flag = true)
-    Note over OrderPanel: <CryptoOrderForm> NOT rendered — flag = false
-    OrderPanel-->>User: order panel shows Equity + Options; Crypto hidden
+    Note over OrderPanel: CryptoOrderForm NOT rendered — flag is false
+    OrderPanel-->>User: order panel shows Equity + Options (Crypto hidden)
 
-    Note over ComplianceOfficer: Compliance officer receives approval for<br/>crypto trading for all EU customers
+    Note over ComplianceOfficer: Approval received for crypto trading for all EU customers
 
-    ComplianceOfficer->>LDEdge: update flag: trading.crypto_pairs.enabled<br/>  rule: segment "EU_customers" → true
+    ComplianceOfficer->>LDEdge: update flag trading.crypto_pairs.enabled — rule: EU_customers segment = true
 
     LDEdge-->>FlagClient: streaming update received — flag changed
     FlagClient-->>OrderPanel: useFeatureFlag("trading.crypto_pairs.enabled") → re-evaluate → true
@@ -508,7 +508,7 @@ sequenceDiagram
     participant FlagSingleton as @fintechbank/feature-flags (one instance in heap)
     participant AuditSingleton as @fintechbank/audit-client (one instance in heap)
 
-    Note over Browser,AuditSingleton: Shell bootstrap already ran (Flow 1).<br/>All six singletons registered in SharedScope.
+    Note over Browser,AuditSingleton: Shell bootstrap complete — all six singletons registered in SharedScope
 
     Browser->>DashboardMF: import("dashboard/App") — React.lazy() triggered
 
@@ -531,7 +531,7 @@ sequenceDiagram
     DashboardMF->>AuditSingleton: reference acquired — same batch queue
 
     DashboardMF-->>Browser: DashboardApp component resolved
-    Note over Browser,AuditSingleton: Dashboard bundle delivered WITHOUT:<br/>  react (~130KB), auth-context (~30KB),<br/>  feature-flags (~20KB), audit-client (~15KB)<br/>  → ~195KB saved per MFE load
+    Note over Browser,AuditSingleton: Dashboard bundle excludes react + auth-context + feature-flags + audit-client (~195KB saved)
 ```
 
 ### Flow 6 — Singleton Resolution Failure Scenarios
@@ -679,7 +679,7 @@ sequenceDiagram
 
         Dev->>StorybookTest: storybook test (CI mode)
         StorybookTest->>StorybookTest: run play() on CurrencyInput, PaymentForm, KYCDocumentCard
-        Note over StorybookTest: play() uses real Playwright in Storybook CI<br/>userEvent.type, userEvent.click → asserts DOM state
+        Note over StorybookTest: play() — real Playwright in CI; userEvent.type + userEvent.click assert DOM state
         StorybookTest-->>Dev: ✅ interaction tests passed
 
         StorybookTest->>AxeCore: axe-core scan all stories
@@ -798,11 +798,11 @@ sequenceDiagram
     participant PaymentAPI as Payment API
     participant IdP as Identity Provider (/token endpoint)
 
-    Note over TradingApp,IdP: User has been on the platform for 14 minutes.<br/>access_token expires in 60 seconds (silent refresh threshold).
+    Note over TradingApp,IdP: User on platform 14 min — access_token expires in 60s, silent refresh threshold reached
 
     AuthCtx->>AuthCtx: token expiry timer fires — 60s before access_token expires
     activate AuthCtx
-    AuthCtx->>IdP: POST /token { grant_type: "refresh_token" }<br/>(browser automatically attaches httpOnly refresh_token cookie)
+    AuthCtx->>IdP: POST /token { grant_type: "refresh_token" } — browser auto-attaches httpOnly refresh_token cookie
     activate IdP
     IdP-->>AuthCtx: { access_token: NEW_TOKEN (15 min TTL) }
     deactivate IdP
@@ -861,13 +861,13 @@ sequenceDiagram
     actor ComplianceOfficer as Compliance Officer
 
     PaymentsApp->>AuditClient: dispatch({ event: "PAYMENT_INITIATED", amount: 5000, recipientMasked: "****1234", userId })
-    Note over AuditClient: Event enqueued in memory buffer (max 50 events)<br>Non-blocking — PaymentsApp continues immediately
+    Note over AuditClient: Enqueued in memory buffer (max 50 events) — non-blocking, PaymentsApp continues immediately
 
     PaymentsApp->>AuditClient: dispatch({ event: "PAYMENT_SUBMITTED", transactionId: "TXN-29481" })
 
     Note over AuditClient: Buffer flush timer fires (every 5s) OR buffer reaches 50 events
 
-    AuditClient->>AuditAPI: POST /audit/events [batchOf2]<br/>{ events: [...], sessionId, clientTimestamp }
+    AuditClient->>AuditAPI: POST /audit/events — batch { events: [...], sessionId, clientTimestamp }
     activate AuditAPI
 
     AuditAPI->>AuditAPI: enrich events: { serverTimestamp, ipAddress, userAgent }
@@ -875,7 +875,7 @@ sequenceDiagram
     EventSigner-->>AuditAPI: signature appended to each event
 
     AuditAPI->>KafkaTopic: produce events to audit.events topic (partition by userId)
-    Note over KafkaTopic: append-only — no UPDATE or DELETE operations permitted<br/>Kafka topic retention: 7 years (FCA requirement)
+    Note over KafkaTopic: Append-only — no UPDATE or DELETE permitted. Retention: 7 years (FCA requirement)
     KafkaTopic-->>AuditAPI: offset committed ✅
     AuditAPI-->>AuditClient: 202 Accepted
 
@@ -952,7 +952,7 @@ sequenceDiagram
     participant Nav as GlobalNavbar
 
     User->>Entry: GET http://localhost:3000 (page load)
-    Note over Entry: index.js: import("./bootstrap")<br/>async boundary gives MF runtime an event-loop tick
+    Note over Entry: index.js — async boundary via import("./bootstrap") gives MF runtime an event-loop tick
 
     Entry->>MFRuntime: initContainerAsync()
     activate MFRuntime
@@ -1163,7 +1163,7 @@ sequenceDiagram
     ProductCard-->>ProductGrid: filtered cards rendered
     ProductGrid-->>User: grid shows "headphones" in "Electronics" only
 
-    Note over SearchBar, ProductCard: All state is local to ListingApp —<br/>Container and other remotes are unaware of filter state.
+    Note over SearchBar, ProductCard: All state is local to ListingApp — Container and other remotes are unaware
 
     User->>ProductCard: clicks product card
     ProductCard->>FilterState: navigate to product detail (internal sub-route)
@@ -1230,7 +1230,7 @@ sequenceDiagram
     activate ListingApp
 
     ListingApp->>Window: window.dispatchEvent(new CustomEvent("cart:add", { detail: { product } }))
-    Note over ListingApp,Window: ListingApp does NOT import CartApp.<br/>Zero coupling — event is the entire contract.
+    Note over ListingApp,Window: ListingApp does NOT import CartApp — zero coupling, event is the contract
     deactivate ListingApp
 
     Window-->>CartApp: addEventListener("cart:add") handler fires
@@ -1248,7 +1248,7 @@ sequenceDiagram
     CartApp-->>User: cart count badge increments in nav
     deactivate CartApp
 
-    Note over ProductCard, LocalStorage: Cart MFE does NOT import Listing MFE.<br/>Communication is entirely unidirectional via window events.
+    Note over ProductCard, LocalStorage: Cart MFE does NOT import Listing MFE — unidirectional via window events
 ```
 
 ### Flow 4 — Layer Call Chain
@@ -1459,9 +1459,9 @@ sequenceDiagram
     deactivate CartMF
 
     CartMF-->>Browser: CartApp component available
-    Note over Browser,ReactSingleton: Cart MFE's React hooks use the SAME instance<br/>as Container → no "Invalid hook call" error
+    Note over Browser,ReactSingleton: Cart MFE React hooks use the SAME instance — no "Invalid hook call" error
 
-    Note over Browser, ReactSingleton: If Cart had shipped with react@18.3.0 + singleton:false:<br/>TWO React instances in heap → hooks throw at runtime<br/>"Invalid hook call. Hooks can only be called inside..."
+    Note over Browser, ReactSingleton: Two React instances = hooks throw "Invalid hook call. Hooks can only be called inside..."
 ```
 
 ### Flow 6 — Singleton Resolution Outcomes
@@ -1539,12 +1539,12 @@ sequenceDiagram
 
     CI->>CDN: upload dist/listing.[NEW_HASH].js (Cache-Control: max-age=31536000,immutable)
     CI->>CDN: upload dist/remoteEntry.js (Cache-Control: no-cache)
-    Note over CI,CDN: remoteEntry.js MUST be no-cache — it is the version manifest<br/>listing.[HASH].js can be cached forever — hash changes on every build
+    Note over CI,CDN: remoteEntry.js must be no-cache (version manifest); listing.[HASH].js is immutable (hash changes on rebuild)
 
     CDN-->>CI: assets deployed ✅
     deactivate CI
 
-    Note over ContainerTeam: Container team was NOT involved.<br/>Container is NOT redeployed.<br/>No release coordination needed.
+    Note over ContainerTeam: Container was NOT redeployed — no release coordination needed
 
     UserA->>CDN: current tab still has OLD remoteEntry.js cached
     Note over UserA,CDN: Old user sees old Listing until they hard-refresh or reopen tab
