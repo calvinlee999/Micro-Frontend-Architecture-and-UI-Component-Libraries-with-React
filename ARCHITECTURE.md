@@ -1,13 +1,1040 @@
-# Micro-Frontend Architecture with React — Architecture Reference
+# FinTech Enterprise Micro-Frontend Architecture — Architecture Reference
 
-> **Module:** E-Commerce Platform · Webpack Module Federation · React 18 · Tailwind CSS  
-> **Principal architect view:** MFE topology, Module Federation wiring, shared dependency strategy, routing, state, infrastructure, and testing.
+> **Platform:** Digital Banking & Wealth Platform · Webpack Module Federation · React 18 · Design System (Storybook 8) · TypeScript · Tailwind CSS  
+> **Perspective:** Principal Front-End Solution Architect · Principal Front-End Quality Engineer  
+> **Regulatory scope:** PCI-DSS Level 1 · SOC 2 Type II · PSD2 / Open Banking · WCAG 2.1 AA  
+> **Principal architect view:** MFE topology, Design System library architecture, Module Federation wiring, OAuth2/OIDC auth layer, shared dependency strategy, PCI-DSS boundary, feature flags, audit trail, accessibility gates, multi-region deployment, and testing pyramid.
 
 ---
 
 ## 1. Overall System Architecture
 
-Five independent applications collaborate through Webpack Module Federation. The `container` is the **host** — it owns the shell, global navigation, and routing. The three **remotes** (`listing`, `cart`, `checkout`) are deployed independently and expose their components at runtime.
+Six independently deployable applications form the **Digital Banking & Wealth Platform**, integrated at runtime via Webpack Module Federation. A shared **Design System Library** (`@fintechbank/design-system`) is published to a private npm registry and consumed as a build-time dependency by all MFEs. The `shell` is the **host** — it owns the authentication guard, global navigation, routing, the feature-flag client, and the audit trail dispatcher. The five **remotes** each map to a distinct regulated domain.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│  Browser                                                                                    │
+│                                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Shell — Auth-Gated Host (port 3000)                                                │  │
+│  │  OAuth2 PKCE · React Router · Global Nav · Feature Flags · Audit Dispatcher        │  │
+│  │                                                                                      │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────────┐  │  │
+│  │  │ /dashboard  │  │ /payments   │  │ /trading    │  │ /compliance              │  │  │
+│  │  │ ↓ lazy load │  │ ↓ lazy load │  │ ↓ lazy load │  │ ↓ lazy load            │  │  │
+│  │  │ Dashboard   │  │ Payments    │  │ Trading     │  │ Compliance MFE          │  │  │
+│  │  │ MFE :3001   │  │ MFE :3002   │  │ MFE :3003   │  │ (KYC/AML) :3004        │  │  │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └──────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                             │
+│  Shared singletons (Module Federation):  react · react-dom · react-router-dom             │
+│  Shared build-time (npm package):        @fintechbank/design-system (Storybook 8)          │
+│  Auth context (shared singleton):        @fintechbank/auth-context                         │
+│  Feature flags (shared singleton):       @fintechbank/feature-flags (LaunchDarkly SDK)     │
+└─────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Platform runtime topology:**
+
+```
+User authenticates via OAuth2 PKCE (Identity Provider)
+    │
+    ▼
+Shell (port 3000) — validates id_token · stores access_token in memory (NOT localStorage)
+    │
+    ▼
+React Router matches route → AuthGuard checks token validity
+    │
+    ▼
+React.lazy() + Suspense triggers dynamic import of domain MFE
+    │
+    ▼
+Browser fetches remoteEntry.js from MFE CDN origin
+    │
+    ▼
+Module Federation runtime resolves shared deps (react singleton, auth-context singleton)
+    │
+    ▼
+Domain MFE component mounts — inherits auth context, feature flags, audit dispatcher
+    │
+    ▼
+MFE makes API call with Authorization: Bearer <access_token> (from auth context)
+```
+
+---
+
+## 2. Module Federation Topology
+
+```
+┌───────────────── HOST ───────────────────────────────────────────────────────────────────────┐
+│  shell (port 3000)                                                                           │
+│                                                                                              │
+│  ModuleFederationPlugin {                                                                    │
+│    name: "shell",                                                                            │
+│    remotes: {                                                                                │
+│      dashboard:  "dashboard@<dashboard-cdn>/remoteEntry.js",                               │
+│      payments:   "payments@<payments-cdn>/remoteEntry.js",                                 │
+│      trading:    "trading@<trading-cdn>/remoteEntry.js",                                   │
+│      compliance: "compliance@<compliance-cdn>/remoteEntry.js",                             │
+│    },                                                                                        │
+│    shared: {                                                                                 │
+│      react:                     { singleton: true, requiredVersion: "^18.3.0" },           │
+│      "react-dom":               { singleton: true, requiredVersion: "^18.3.0" },           │
+│      "react-router-dom":        { singleton: true, requiredVersion: "^6.22.0" },           │
+│      "@fintechbank/auth-context":   { singleton: true },                                   │
+│      "@fintechbank/feature-flags":  { singleton: true },                                   │
+│      "@fintechbank/audit-client":   { singleton: true },                                   │
+│    }                                                                                         │
+│  }                                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+        │                │                   │                      │
+        ▼                ▼                   ▼                      ▼
+┌───────────────┐ ┌──────────────┐ ┌────────────────┐ ┌─────────────────────┐
+│ dashboard     │ │ payments     │ │ trading        │ │ compliance          │
+│ (port 3001)   │ │ (port 3002)  │ │ (port 3003)    │ │ (port 3004)         │
+│               │ │              │ │                │ │                     │
+│ exposes:      │ │ exposes:     │ │ exposes:       │ │ exposes:            │
+│  "./App"      │ │  "./App"     │ │  "./App"       │ │  "./App"            │
+│ (accounts,    │ │ (send money, │ │ (market data,  │ │ (KYC forms,         │
+│  portfolio    │ │  history,    │ │  order book,   │ │  AML checks,        │
+│  summary)     │ │  open bank)  │ │  portfolio)    │ │  doc upload)        │
+└───────────────┘ └──────────────┘ └────────────────┘ └─────────────────────┘
+
+All four remotes consume: @fintechbank/design-system (npm — build-time dependency)
+```
+
+**Why `@fintechbank/auth-context` is a shared singleton:**  
+The access token lives exclusively in memory inside the auth context — never in `localStorage` or `sessionStorage` (XSS mitigation). Every MFE that needs to attach `Authorization: Bearer` headers reads from the same auth context instance. If it were not a singleton, each MFE would hold a separate token copy that desynchronises on silent refresh, causing 401s mid-session.
+
+---
+
+## 3. Design System Library Architecture (Storybook 8)
+
+> **Source:** Inspired by the LinkedIn Learning course *Building Scalable React UI Component Libraries with Storybook*.  
+> **Package:** `@fintechbank/design-system` — published to a private npm registry (GitHub Packages / JFrog Artifactory).  
+> **Principal view:** The Design System is the single source of truth for all UI primitives. Every MFE consumes it as a versioned dependency. No MFE builds its own buttons, inputs, or colour palette.
+
+### 3.1 Atomic Design Hierarchy
+
+```
+@fintechbank/design-system
+    │
+    ├── tokens/              ← Design tokens (CSS custom properties + TS constants)
+    │   ├── colours.ts       ← Brand palette, semantic aliases (--color-danger, etc.)
+    │   ├── typography.ts    ← Font scale, weights, line-heights
+    │   ├── spacing.ts       ← 4px grid — 4, 8, 12, 16, 24, 32, 48, 64
+    │   └── motion.ts        ← Easing curves, duration scale (regulatory: no animation > 200ms)
+    │
+    ├── atoms/               ← Indivisible primitives — no domain knowledge
+    │   ├── Button/          ← primary | secondary | ghost | destructive variants
+    │   ├── Input/           ← text | number | currency | masked (sort code, IBAN)
+    │   ├── Badge/           ← status badges: pending | settled | rejected | flagged
+    │   ├── Icon/            ← SVG sprite wrapper — accessible title + aria-hidden
+    │   ├── Avatar/          ← User / account avatar
+    │   └── Spinner/         ← Accessible loading indicator (aria-busy, aria-label)
+    │
+    ├── molecules/           ← Compositions of atoms — still domain-agnostic
+    │   ├── FormField/       ← Input + Label + InlineError (WCAG 2.1 SC 3.3.1)
+    │   ├── CurrencyInput/   ← Input + currency symbol + locale formatting
+    │   ├── DataTable/       ← Sortable, paginated table with aria-sort
+    │   ├── StatusCard/      ← Icon + Badge + amount — transaction summary unit
+    │   └── Alert/           ← info | warning | error | success — role="alert"
+    │
+    ├── organisms/           ← Domain-aware composed layouts
+    │   ├── AccountHeader/   ← Account name + balance + masked account number
+    │   ├── TransactionRow/  ← Merchant logo + description + amount + status badge
+    │   ├── PaymentForm/     ← Multi-field payment entry — uses FormField molecules
+    │   └── KYCDocumentCard/ ← Document type + upload zone + verification status
+    │
+    └── storybook/           ← Storybook 8 configuration
+        ├── .storybook/      ← main.ts | preview.ts | manager.ts
+        ├── chromatic.config.ts ← Visual regression config (Chromatic)
+        └── a11y.config.ts   ← axe-core accessibility addon config
+```
+
+### 3.2 Design Token Strategy
+
+```ts
+// tokens/colours.ts — semantic alias layer over brand palette
+export const tokens = {
+  // Brand primitives (never used directly in components)
+  palette: {
+    cobalt50:  "#EBF2FF",
+    cobalt500: "#1A56DB",
+    cobalt900: "#0C2461",
+    red500:    "#E02424",
+    green500:  "#057A55",
+    amber500:  "#C27803",
+    neutral50: "#F9FAFB",
+  },
+  // Semantic aliases — what components reference
+  color: {
+    primary:          "var(--color-cobalt500)",
+    danger:           "var(--color-red500)",
+    success:          "var(--color-green500)",
+    warning:          "var(--color-amber500)",
+    surfaceDefault:   "var(--color-neutral50)",
+    textPrimary:      "var(--color-neutral900)",
+    textSecondary:    "var(--color-neutral600)",
+  },
+} as const;
+```
+
+**Principal rule:** Components must only reference semantic tokens (`color.danger`), never palette primitives (`palette.red500`). This allows white-labelling (swapping the token values at the CSS custom property layer) without touching component code.
+
+### 3.3 Storybook as Living Specification
+
+```
+Storybook 8 serves three audiences simultaneously:
+┌───────────────────────────────────────────────────────────────┐
+│  DESIGNERS  — Visual preview, token showcase, variant matrix  │
+│  ENGINEERS  — Copy-paste usage, props API, do/don't examples  │
+│  QA / COMPLIANCE — Accessibility audit, WCAG status per story │
+└───────────────────────────────────────────────────────────────┘
+
+Each component story covers:
+  1. Default state
+  2. All named variants
+  3. Error / disabled states
+  4. Accessibility panel (axe-core violations = CI fail)
+  5. Interaction tests (play() function — user events in story)
+  6. Chromatic snapshot (visual regression baseline)
+```
+
+```ts
+// atoms/Button/Button.stories.tsx — Production-grade story format
+import type { Meta, StoryObj } from "@storybook/react";
+import { userEvent, within, expect } from "@storybook/test";
+import { Button } from "./Button";
+
+const meta: Meta<typeof Button> = {
+  title: "Atoms/Button",
+  component: Button,
+  tags: ["autodocs"],          // auto-generate Props docs page
+  parameters: {
+    a11y: { element: "#storybook-root" },  // axe-core on every story
+    chromatic: { delay: 300 },             // wait for animations
+  },
+};
+export default meta;
+type Story = StoryObj<typeof Button>;
+
+export const Primary: Story = {
+  args: { variant: "primary", children: "Confirm Payment" },
+};
+
+export const DestructiveWithInteraction: Story = {
+  args: { variant: "destructive", children: "Cancel Transfer" },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const btn = canvas.getByRole("button", { name: /cancel transfer/i });
+    await userEvent.click(btn);
+    await expect(btn).toHaveFocus();  // verify focus management after click
+  },
+};
+```
+
+### 3.4 Component Library CI Pipeline
+
+```
+PR opened to @fintechbank/design-system repo
+    │
+    ├── TypeScript typecheck (tsc --noEmit)
+    ├── ESLint + Prettier
+    ├── Jest unit tests (component logic, hook behaviour)
+    ├── Storybook interaction tests (play() functions)
+    ├── axe-core accessibility scan (0 violations = pass)
+    ├── Chromatic visual snapshot diff  ← blocks merge if unexpected diff
+    │     └── Requires designer sign-off on UI changes
+    └── npm publish (semver bump) → GitHub Packages
+              │
+              ▼
+    MFEs upgrade via Renovate bot PR (weekly minor/patch auto-merge)
+```
+
+---
+
+## 4. Authentication and Authorization Layer
+
+### 4.1 OAuth2 PKCE Flow
+
+```
+User opens platform
+    │
+    ▼
+Shell bootstrap — checks memory for valid access_token
+    │
+    ├── Token present + not expiring < 60s? → Continue (silent path)
+    │
+    └── No token / near-expiry?
+            │
+            ▼
+        Generate PKCE code_verifier + code_challenge (SHA-256)
+        Redirect to Identity Provider (IdP) /authorize endpoint
+            │
+            ▼
+        User authenticates (password + TOTP / biometric)
+            │
+            ▼
+        IdP redirects back with authorization_code
+            │
+            ▼
+        Shell POST /token { code, code_verifier, client_id }
+            │
+            ▼
+        IdP returns: access_token (15 min TTL) + id_token + refresh_token (httpOnly cookie)
+            │
+            ▼
+        Shell stores access_token in React auth context (memory only — NOT localStorage)
+        Shell decodes id_token claims → user profile (name, roles, permitted_accounts)
+            │
+            ▼
+        Shell initialises: audit client (userId), feature flag client (userId, roles)
+            │
+            ▼
+        React tree renders — AuthContext.Provider wraps entire app
+```
+
+### 4.2 Route-Level Authorization Guard
+
+```tsx
+// shell/src/components/AuthGuard.tsx
+interface AuthGuardProps {
+  requiredRole: "customer" | "relationship_manager" | "compliance_officer";
+  children: React.ReactNode;
+}
+
+export const AuthGuard: React.FC<AuthGuardProps> = ({ requiredRole, children }) => {
+  const { user, isAuthenticated } = useAuthContext();
+
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (!user.roles.includes(requiredRole)) return <ForbiddenPage />;
+  return <>{children}</>;
+};
+
+// Usage in shell routing:
+<Route
+  path="/compliance/*"
+  element={
+    <AuthGuard requiredRole="compliance_officer">
+      <Suspense fallback={<PageLoader />}>
+        <ComplianceMFE />
+      </Suspense>
+    </AuthGuard>
+  }
+/>
+```
+
+### 4.3 Token Security Rules
+
+| Concern | Rule | Rationale |
+|---|---|---|
+| Token storage | Memory only (React context) | localStorage/sessionStorage is readable by XSS; memory is not |
+| Refresh token | httpOnly cookie ONLY | JS cannot read httpOnly cookies — XSS cannot steal refresh token |
+| Token transmission | `Authorization: Bearer` header ONLY | Never in URL query params (logged in access logs) |
+| Token validation | Shell validates on every route change | Expired token caught before domain MFE mounts |
+| Silent refresh | 60s before expiry trigger | Prevents mid-flow 401s on slow Payments forms |
+| Logout | Revoke refresh token + clear auth context + navigate to /login | Clears all in-memory tokens |
+
+---
+
+## 5. Layer Summary Tables
+
+> End-to-end breakdown of each application.  
+> Ordered: Shell (Host) → Design System → Dashboard → Payments → Trading → Compliance → Shared Infrastructure → Test Layer.
+
+---
+
+### 5.0 Shell — Auth-Gated Host Application
+
+> **Role:** Platform entry point — owns the OAuth2 PKCE auth flow, global navigation, React Router, Suspense boundaries, feature flag client initialisation, and audit trail dispatcher. Provides shared context (auth, flags, audit) to all remotes.  
+> **Pattern:** Thin shell — zero business logic. All domain logic lives in remotes.  
+> **Key Features:** Module Federation host · OAuth2 PKCE · React Router DOM · Tailwind CSS · React.lazy + Suspense · Auth/FeatureFlag/Audit singletons.
+
+#### 5.0a — Shell Responsibility Boundary
+
+| Concern | Shell Owns | Remote Owns |
+|---|---|---|
+| OAuth2 PKCE auth flow | ✅ | ❌ |
+| access_token in memory | ✅ (AuthContext) | ❌ reads via useAuthContext() |
+| Browser URL / history | ✅ BrowserRouter | ❌ Must not define BrowserRouter |
+| Global navigation bar | ✅ | ❌ |
+| Route definitions | ✅ | ❌ |
+| AuthGuard per route | ✅ | ❌ |
+| Suspense fallback + Error Boundary | ✅ | ❌ |
+| Feature flag client initialisation | ✅ | ❌ reads via useFeatureFlag() |
+| Audit event dispatcher | ✅ initialises | ✅ dispatches domain events |
+| Domain UI (account balances, payment form) | ❌ | ✅ |
+| Domain API calls | ❌ | ✅ |
+| Internal sub-routes | ❌ | ✅ (via Routes inside remote) |
+
+#### 5.0b — webpack.config.js — Module Federation Host Configuration
+
+```ts
+// shell/webpack.config.ts
+new ModuleFederationPlugin({
+  name: "shell",
+  remotes: {
+    dashboard:  "dashboard@<dashboard-cdn-url>/remoteEntry.js",
+    payments:   "payments@<payments-cdn-url>/remoteEntry.js",
+    trading:    "trading@<trading-cdn-url>/remoteEntry.js",
+    compliance: "compliance@<compliance-cdn-url>/remoteEntry.js",
+  },
+  shared: {
+    react:                        { singleton: true, requiredVersion: "^18.3.0" },
+    "react-dom":                  { singleton: true, requiredVersion: "^18.3.0" },
+    "react-router-dom":           { singleton: true, requiredVersion: "^6.22.0" },
+    "@fintechbank/auth-context":  { singleton: true, requiredVersion: "^3.0.0" },
+    "@fintechbank/feature-flags": { singleton: true, requiredVersion: "^2.0.0" },
+    "@fintechbank/audit-client":  { singleton: true, requiredVersion: "^1.0.0" },
+  },
+})
+```
+
+#### 5.0c — Shell Bootstrap Pattern (Bootstrap Indirection + Auth Init)
+
+```ts
+// shell/src/index.ts — async boundary for Module Federation negotiation
+import("./bootstrap");
+
+// shell/src/bootstrap.tsx — auth + provider initialisation
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { AuthProvider } from "@fintechbank/auth-context";
+import { FeatureFlagProvider } from "@fintechbank/feature-flags";
+import { AuditProvider } from "@fintechbank/audit-client";
+import App from "./App";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <AuthProvider config={authConfig}>       {/* OAuth2 PKCE initialisation */}
+      <FeatureFlagProvider>                  {/* LaunchDarkly SDK — user context set after auth */}
+        <AuditProvider>                      {/* Compliance audit trail */}
+          <App />
+        </AuditProvider>
+      </FeatureFlagProvider>
+    </AuthProvider>
+  </React.StrictMode>
+);
+```
+
+---
+
+### 5.1 Dashboard — Account Overview Micro-Frontend
+
+> **Role:** Displays account balances, portfolio summary, recent transactions, and personalised financial insights. The first screen users see after authentication.  
+> **Pattern:** Remote MFE. Read-heavy — primarily data visualisation. Consumes Account API and Analytics API.  
+> **Key Features:** Module Federation remote · React Query (server state) · Recharts (accessible charts) · Design System components.
+
+#### 5.1a — Component Responsibility Matrix
+
+| Component | Responsibility | Design System Atom |
+|---|---|---|
+| `<AccountSummaryCard>` | Balance + account number (masked) | `AccountHeader` organism |
+| `<PortfolioChart>` | Holdings breakdown (Recharts area chart) | Custom — accessible SVG |
+| `<TransactionFeed>` | Last 10 transactions, paginated | `TransactionRow` organism |
+| `<InsightBanner>` | AI-driven spending insight | `Alert` molecule |
+| `<QuickActions>` | Send / Receive / Statement buttons | `Button` atom |
+
+#### 5.1b — Data Fetching Pattern (React Query)
+
+```ts
+// dashboard/src/hooks/useAccountSummary.ts
+import { useQuery } from "@tanstack/react-query";
+import { useAuthContext } from "@fintechbank/auth-context";
+
+export const useAccountSummary = (accountId: string) => {
+  const { getAccessToken } = useAuthContext();
+
+  return useQuery({
+    queryKey: ["account-summary", accountId],
+    queryFn: async () => {
+      const token = await getAccessToken();   // handles silent refresh
+      const res = await fetch(`/api/accounts/${accountId}/summary`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new ApiError(res.status, await res.json());
+      return res.json() as Promise<AccountSummary>;
+    },
+    staleTime: 30_000,          // 30s — balance data is semi-real-time
+    retry: (count, error) =>
+      error instanceof ApiError && error.status !== 401 && count < 2,
+  });
+};
+```
+
+---
+
+### 5.2 Payments — Regulated Payment Micro-Frontend
+
+> **Role:** Send money (domestic + international), view payment history, manage standing orders, and Open Banking payment initiation. Highest regulatory exposure domain.  
+> **Pattern:** Remote MFE. Payments data and submission are PCI-DSS controlled — card data entry uses a sandboxed iframe hosted on an isolated PCI scope subdomain.  
+> **Key Features:** Module Federation remote · PCI-DSS iframe for card data · PSD2 SCA (Strong Customer Authentication) step-up · Audit event dispatch on every mutation.
+
+#### 5.2a — PCI-DSS Boundary Architecture
+
+```
+Payments MFE (/payments) — NOT in PCI scope
+    │
+    │  User clicks "Pay with Card"
+    │
+    ▼
+Shell navigates to PCI-scope route: /payments/card-capture
+    │
+    ▼
+<PCIFrame> renders — isolated iframe origin:
+  https://pci.fintechbank.com  (separate subdomain, separate infra)
+    │
+    │  Parent shell and Payments MFE can NOT read the iframe DOM
+    │  Card number, CVV, expiry live ONLY in the PCI iframe
+    │
+    ▼
+User enters card data in iframe
+    │
+    ▼
+PCI iframe POSTs tokenisation request to PCI vault
+  → returns opaque payment_method_token (no raw card data crosses)
+    │
+    ▼
+PCI iframe postMessage({ type: "PAYMENT_TOKEN", token }) to parent
+    │ postMessage target origin MUST be "https://app.fintechbank.com" (strict)
+    ▼
+Payments MFE receives token via window.addEventListener("message", handler)
+    │ validates event.origin strictly
+    ▼
+Payments MFE submits payment_method_token to Payment API
+  POST /api/payments { amount, recipient, payment_method_token }
+    │
+    ▼
+Payment API processes via payment processor — returns transaction_id
+```
+
+**PCI-DSS principle:** Raw card data (PAN, CVV, expiry) must never touch the React application, the browser's JS heap, or any CDN-served asset. The iframe boundary enforces this — the parent window JavaScript cannot inspect or intercept iframe DOM nodes when the iframe is cross-origin.
+
+#### 5.2b — Payment Audit Hook
+
+```ts
+// payments/src/hooks/usePaymentAudit.ts
+import { useAuditClient } from "@fintechbank/audit-client";
+
+export const usePaymentAudit = () => {
+  const audit = useAuditClient();
+
+  return {
+    onPaymentInitiated: (amount: number, recipient: string) =>
+      audit.dispatch({
+        event:    "PAYMENT_INITIATED",
+        domain:   "payments",
+        severity: "INFO",
+        payload:  { amount, recipientMasked: maskAccountNumber(recipient) },
+      }),
+    onPaymentSubmitted: (transactionId: string) =>
+      audit.dispatch({
+        event:    "PAYMENT_SUBMITTED",
+        domain:   "payments",
+        severity: "INFO",
+        payload:  { transactionId },
+      }),
+    onPaymentFailed: (error: ApiError) =>
+      audit.dispatch({
+        event:    "PAYMENT_FAILED",
+        domain:   "payments",
+        severity: "WARN",
+        payload:  { errorCode: error.code },
+      }),
+  };
+};
+```
+
+**Principal rule:** Every PSD2-regulated user action (initiate payment, authorise payment, cancel standing order) must produce an immutable audit event. Audit events are append-only, signed, and stored independently of the application database.
+
+---
+
+### 5.3 Trading — Market Data and Order Management Micro-Frontend
+
+> **Role:** Real-time market data display (WebSocket feed), portfolio performance, order placement (equities, ETFs). Subject to MiFID II best-execution and suitability disclosure requirements.  
+> **Pattern:** Remote MFE. Highest performance demands — WebSocket streaming, virtualised data tables (tens of thousands of rows), 60 fps chart updates.  
+> **Key Features:** Module Federation remote · WebSocket (market feed) · TanStack Virtual (row virtualisation) · Recharts / D3 (candlestick charts) · Feature flag gating for new order types.
+
+#### 5.3a — Feature Flag Gate (Order Types)
+
+```ts
+// trading/src/components/OrderPanel.tsx
+import { useFeatureFlag } from "@fintechbank/feature-flags";
+
+export const OrderPanel: React.FC<{ instrument: Instrument }> = ({ instrument }) => {
+  const optionsEnabled = useFeatureFlag("trading.options_chain.enabled");
+  const cryptoEnabled  = useFeatureFlag("trading.crypto_pairs.enabled");
+
+  return (
+    <section aria-labelledby="order-panel-heading">
+      <h2 id="order-panel-heading">Place Order</h2>
+      <EquityOrderForm instrument={instrument} />
+      {optionsEnabled && <OptionsChain instrument={instrument} />}
+      {cryptoEnabled  && <CryptoOrderForm instrument={instrument} />}
+    </section>
+  );
+};
+```
+
+**Principal rule:** New financial instrument types (options, crypto, structured products) must be gated behind feature flags. This allows:
+1. Regulatory approval to precede technical deployment.
+2. Staged rollout — 1% of users, then 10%, then 100%.
+3. Instant kill switch without a code deployment.
+
+---
+
+### 5.4 Compliance — KYC and AML Micro-Frontend
+
+> **Role:** Know Your Customer (KYC) identity verification, Anti-Money Laundering (AML) check status display, document upload (passport, proof of address), and adverse media screening results. Accessed by customers and by compliance officers (role-gated).  
+> **Pattern:** Remote MFE. Separate deployment cadence from other MFEs — compliance workflow changes are driven by regulatory timeline, not product timeline.
+
+#### 5.4a — Role-Gated Views
+
+| Route | Customer view | Compliance Officer view (role: compliance_officer) |
+|---|---|---|
+| `/compliance/status` | Own KYC status + outstanding documents | All customers with pending KYC |
+| `/compliance/documents` | Upload own documents | Review + approve / reject submissions |
+| `/compliance/aml` | Own screening status | Full adverse media report + override controls |
+| `/compliance/audit-log` | Own activity log | Platform-wide audit log with filters |
+
+---
+
+### 5.5 Shared Module Design
+
+#### 5.5a — Shared Dependency Classification
+
+```
+RUNTIME SINGLETONS (Module Federation shared{} — one instance in JS heap)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  react, react-dom             → Hooks + Context require single React root
+  react-router-dom             → One BrowserRouter = one history stack
+  @fintechbank/auth-context    → Single access token in memory
+  @fintechbank/feature-flags   → Single LaunchDarkly client connection
+  @fintechbank/audit-client    → Single audit queue, batched flush
+
+BUILD-TIME DEPENDENCY (npm package — consumed at compile time)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  @fintechbank/design-system   → UI components + design tokens
+  @fintechbank/api-client      → Typed API fetch wrapper (OpenAPI-generated)
+
+NOT SHARED — EACH MFE OWNS ITS OWN COPY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  @tanstack/react-query        → Can duplicate — stateless per MFE cache
+  recharts / d3                → Can duplicate — rendering only
+  Internal components          → Domain-specific, not re-used
+  Internal hooks               → useAccountSummary, useOrderBook
+```
+
+#### 5.5b — Design System Version Governance
+
+| Situation | SLA | Process |
+|---|---|---|
+| Patch (bug fix, accessibility fix) | 24 hrs | Auto-merge via Renovate across all MFEs |
+| Minor (new component, token addition) | 1 sprint | Renovate PR — team lead review |
+| Major (breaking API, token rename) | 1 quarter | RFC process, migration guide, MFE team coordination |
+| Security patch (XSS fix in component) | 2 hrs (P0) | Emergency all-team deployment |
+
+**Principal rule:** The Design System version is a platform contract. Major version bumps require a coordinated migration. The Design System team publishes a codemod for breaking changes (e.g., renamed props, removed variants).
+
+---
+
+### 5.6 Infrastructure and Deployment
+
+> **Pattern:** Multi-region active-active (us-east-1 primary, eu-west-1 secondary — GDPR data residency) · Blue-green deployment per MFE · Canary traffic splitting · Independent CI/CD pipeline per domain team.
+
+#### 5.6a — Port Allocation (Local Development)
+
+| Application | Port | Entry URL | remoteEntry URL |
+|---|---|---|---|
+| `shell` | 3000 | `http://localhost:3000` | N/A (host) |
+| `dashboard` | 3001 | `http://localhost:3001` | `http://localhost:3001/remoteEntry.js` |
+| `payments` | 3002 | `http://localhost:3002` | `http://localhost:3002/remoteEntry.js` |
+| `trading` | 3003 | `http://localhost:3003` | `http://localhost:3003/remoteEntry.js` |
+| `compliance` | 3004 | `http://localhost:3004` | `http://localhost:3004/remoteEntry.js` |
+| `design-system` (Storybook) | 6006 | `http://localhost:6006` | N/A (npm, not MF) |
+
+#### 5.6b — Canary Deployment Flow
+
+```
+Payments team merges to main → triggers payments CI pipeline
+    │
+    ▼
+CI: typecheck → lint → unit test → Storybook interaction test → accessibility scan
+    │
+    ▼
+CI: Playwright smoke E2E against staging environment
+    │
+    ▼
+Build: webpack production bundle
+  dist/remoteEntry.js               (~2 KB manifest)
+  dist/payments.[NEW_HASH].js       (~300 KB domain bundle)
+    │
+    ▼
+Deploy dist/ to CDN — CANARY origin:
+  https://payments-cdn.fintechbank.com/canary/remoteEntry.js
+    │
+    ▼
+CDN edge rule: route 5% of traffic to canary/remoteEntry.js
+  Check: error rates, p99 latency, Core Web Vitals
+    │
+    ├── Metrics nominal for 30 min? → promote to 100% (swap remoteEntry.js path)
+    │
+    └── Error rate spike? → rollback: point remoteEntry.js back to previous hash
+```
+
+#### 5.6c — CDN Cache Strategy (FinTech Rules)
+
+| Asset | Cache-Control | Reason |
+|---|---|---|
+| `remoteEntry.js` | `no-cache, no-store` | Version manifest — zero TTL in FinTech (regulatory audit trail) |
+| `payments.[hash].js` | `max-age=31536000, immutable` | Content-hashed — hash changes on rebuild |
+| `shell/index.html` | `no-cache` | Entry point must always be current |
+| API responses | `no-store` | Financial data must never be cached on CDN |
+
+**FinTech tightening vs generic e-commerce:** `no-store` on `remoteEntry.js` (not just `no-cache`) prevents any intermediate proxy or service worker from storing the manifest. This is required to ensure that every page load fetches the definitive current version — important for audit trail accuracy.
+
+#### 5.6d — Build Pipeline per Domain Team (GitHub Actions)
+
+```yaml
+# .github/workflows/payments-deploy.yml
+name: Deploy Payments MFE
+on:
+  push:
+    paths: ["packages/payments/**"]
+    branches: [main]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+        working-directory: packages/payments
+
+      - name: Type Check
+        run: npx tsc --noEmit
+        working-directory: packages/payments
+
+      - name: Unit & Integration Tests
+        run: npm test -- --watchAll=false --coverage --coverageThreshold='{"global":{"lines":80}}'
+        working-directory: packages/payments
+
+      - name: Accessibility Scan (axe-core)
+        run: npm run test:a11y
+        working-directory: packages/payments
+
+      - name: Build
+        run: npm run build
+        working-directory: packages/payments
+
+      - name: Canary Deploy
+        run: |
+          aws s3 sync packages/payments/dist s3://payments-cdn-bucket/canary \
+            --cache-control "max-age=31536000,immutable"
+          aws s3 cp packages/payments/dist/remoteEntry.js \
+            s3://payments-cdn-bucket/canary/remoteEntry.js \
+            --cache-control "no-cache,no-store"
+
+      - name: Playwright Smoke E2E (Staging)
+        run: npx playwright test e2e/payments.smoke.spec.ts
+        env:
+          PLAYWRIGHT_BASE_URL: https://staging.fintechbank.com
+```
+
+---
+
+### 5.7 Testing Strategy
+
+> **Role:** Multi-level quality gate with FinTech-specific additions: accessibility auditing (WCAG 2.1 AA), visual regression (Chromatic), security-focused mutation testing, Storybook interaction tests, and compliance boundary contract tests.  
+> **Pattern:** Storybook interaction → Vitest/Jest unit → Visual regression (Chromatic) → Accessibility (axe) → Contract → E2E (Playwright).
+
+#### 5.7a — Test Layer Overview
+
+| Layer | Scope | Tool | Speed | Trigger |
+|---|---|---|---|---|
+| Storybook Interaction | Component user events in isolation | Storybook play() + Testing Library | < 1 min | Every commit (Storybook CI) |
+| Unit | Single component / hook in isolation | Vitest + React Testing Library | < 30 s | Every commit |
+| Visual Regression | Pixel-diff vs Chromatic baseline | Chromatic (Storybook snapshots) | 2–5 min | Every PR |
+| Accessibility | WCAG 2.1 AA violations | axe-core (jest-axe + Storybook addon) | < 1 min | Every PR |
+| Integration | MFE standalone with mocked APIs | Vitest (JSDOM) + RTL + MSW | < 2 min | Every PR |
+| Contract | Does remoteEntry.js expose expected keys? | Custom manifest assertion | < 30 s | Every PR |
+| E2E Smoke | Critical payment journeys | Playwright (real browser) | 5 min | Every PR |
+| E2E Regression | Full cross-MFE journeys + edge cases | Playwright | 15–20 min | Nightly |
+| Performance Budget | Core Web Vitals (LCP, CLS, INP) | Lighthouse CI | 5 min | Every PR |
+
+#### 5.7b — Accessibility Testing Pattern
+
+```tsx
+// design-system/src/atoms/Button/__tests__/Button.a11y.test.tsx
+import { render } from "@testing-library/react";
+import { axe, toHaveNoViolations } from "jest-axe";
+import { Button } from "../Button";
+
+expect.extend(toHaveNoViolations);
+
+describe("Button — WCAG 2.1 AA", () => {
+  it("has no accessibility violations in default state", async () => {
+    const { container } = render(<Button variant="primary">Confirm Payment</Button>);
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no accessibility violations in disabled state", async () => {
+    const { container } = render(
+      <Button variant="primary" disabled aria-describedby="hint">
+        Submit
+      </Button>
+    );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("loading spinner is announced to screen readers", async () => {
+    const { container, getByRole } = render(<Button loading>Processing...</Button>);
+    expect(getByRole("status")).toBeInTheDocument();  // aria-live region
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+```
+
+#### 5.7c — Performance Budget (Lighthouse CI)
+
+```js
+// lighthouserc.js
+module.exports = {
+  ci: {
+    collect: { url: ["http://localhost:3000/", "http://localhost:3000/dashboard"] },
+    assert: {
+      assertions: {
+        "categories:performance":    ["error", { minScore: 0.9  }],   // 90+ Lighthouse score
+        "categories:accessibility":  ["error", { minScore: 1.0  }],   // 100 — zero violations
+        "first-contentful-paint":    ["error", { maxNumericValue: 1500 }],  // < 1.5s
+        "largest-contentful-paint":  ["error", { maxNumericValue: 2500 }],  // < 2.5s (Core Web Vitals)
+        "cumulative-layout-shift":   ["error", { maxNumericValue: 0.1  }],  // < 0.1 (CWV)
+        "total-blocking-time":       ["error", { maxNumericValue: 300  }],  // < 300ms
+      },
+    },
+  },
+};
+```
+
+**FinTech additional rule:** Accessibility score must be 100 on every PR — financial services applications are subject to the European Accessibility Act (EAA) effective June 2025. A 0.9 accessibility threshold is not acceptable.
+
+#### 5.7d — Module Federation Contract Test
+
+```ts
+// shell/tests/mf-contract.test.ts — verifies remote exposes contract
+import path from "path";
+import fs from "fs";
+
+const EXPECTED_CONTRACTS = {
+  dashboard:  ["./App"],
+  payments:   ["./App"],
+  trading:    ["./App"],
+  compliance: ["./App"],
+};
+
+describe("Module Federation Contract Verification", () => {
+  Object.entries(EXPECTED_CONTRACTS).forEach(([remote, exposedKeys]) => {
+    it(`${remote} remoteEntry.js exposes required keys`, () => {
+      const remoteEntry = fs.readFileSync(
+        path.resolve(__dirname, `../../packages/${remote}/dist/remoteEntry.js`),
+        "utf-8"
+      );
+      exposedKeys.forEach(key => {
+        expect(remoteEntry).toContain(key);
+      });
+    });
+  });
+});
+```
+
+#### 5.7e — Quality Engineer Principal Rules
+
+1. **Accessibility is not optional.** Every component has an axe-core test. Zero violations is a hard CI gate, not a warning. A payment form with an inaccessible submit button is a regulatory defect.
+
+2. **Visual regression protects the design system contract.** Chromatic blocks merge when any component changes visually — requires designer sign-off. This prevents silent Design System drift across MFEs.
+
+3. **Storybook interaction tests replace many integration tests.** The `play()` function runs real user events against the component in a real browser (Storybook uses Playwright internally). This is faster and more isolated than spinning up the full MFE.
+
+4. **Performance budgets are hard gates.** An LCP regression from a new chart library in Trading MFE should fail CI — not be noticed by users. Lighthouse CI runs against a localhost build on every PR.
+
+5. **Contract tests guard the MFE API boundary.** The shell declares it will import `payments/App`. This contract is verified against the built `remoteEntry.js` artifact before any deployment proceeds. Renaming an expose key without updating the shell contract must fail CI — not production.
+
+6. **The test pyramid applies to the Design System too.** `atoms/Button` has more unit tests than `organisms/PaymentForm`. Story tests cover the component API surface. E2E tests verify the organism in context within a real MFE.
+
+---
+
+## 6. Cross-Cutting Concerns
+
+### 6.1 Audit Trail Architecture
+
+```
+Every significant user action dispatches an audit event:
+    │
+    ▼
+useAuditClient().dispatch({ event, domain, severity, payload })
+    │
+    ▼
+AuditClient (shared singleton):
+    │ buffers events in a local queue (max 50 events / flush every 5s)
+    │ flushes to Audit API via POST /api/audit/events (batched)
+    │ retries on network failure (up to 3 attempts, exponential backoff)
+    ▼
+Audit API:
+    │ appends to append-only event store (Apache Kafka topic / AWS Kinesis)
+    │ events are immutable — no UPDATE or DELETE operations permitted
+    │ signs each event with HMAC using audit service key
+    ▼
+Audit store consumed by:
+    ├── Compliance MFE (officer audit log view)
+    ├── SIEM (security alerting — anomaly detection)
+    └── Regulatory reporting (FCA / GDPR data export)
+```
+
+### 6.2 Error Boundary Strategy (FinTech)
+
+```tsx
+// shell/src/components/RemoteErrorBoundary.tsx
+interface RemoteErrorBoundaryProps {
+  remote: string;
+  fallback?: React.ReactNode;
+  children: React.ReactNode;
+}
+
+class RemoteErrorBoundary extends React.Component<RemoteErrorBoundaryProps> {
+  state = { hasError: false, errorId: "" };
+
+  static getDerivedStateFromError() {
+    return { hasError: true, errorId: crypto.randomUUID() };
+  }
+
+  componentDidCatch(error: Error) {
+    // Report to observability platform (Datadog / OpenTelemetry)
+    telemetry.captureException(error, {
+      remote:  this.props.remote,
+      errorId: this.state.errorId,
+      userId:  authContext.user?.id,   // PII — ensure GDPR-compliant telemetry config
+    });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback ?? (
+        <div role="alert" aria-live="assertive" className="p-8 text-center">
+          <p>The {this.props.remote} section is temporarily unavailable.</p>
+          <p>Reference: {this.state.errorId}</p>  {/* for support correlation */}
+          <Button onClick={() => this.setState({ hasError: false, errorId: "" })}>
+            Retry
+          </Button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+```
+
+**FinTech addition vs generic:** The `errorId` is a UUID logged to the telemetry platform and displayed to the user. A support agent can correlate the user-reported reference ID to the exact error event. This is critical for regulated incident investigation.
+
+### 6.3 Content Security Policy
+
+```
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' https://*.fintechbank.com 'nonce-{nonce}';
+  connect-src 'self' https://api.fintechbank.com https://identity.fintechbank.com
+              wss://market-data.fintechbank.com;
+  frame-src https://pci.fintechbank.com;  — only PCI capture iframe allowed
+  img-src 'self' https://cdn.fintechbank.com data:;
+  style-src 'self' 'unsafe-inline';       — required for Tailwind CSS in production
+  object-src 'none';
+  base-uri 'self';
+  form-action 'self';
+  upgrade-insecure-requests;
+```
+
+**Principal rule:** CSP is the last line of defence against XSS. `frame-src` explicitly whitelists only the PCI capture subdomain for iframes — no arbitrary third-party iframe injection is possible. `object-src 'none'` disables Flash and plugin execution entirely.
+
+### 6.4 Bundle Size Philosophy (FinTech)
+
+```
+Shell initial load (authenticated user):
+  react + react-dom:           ~130 KB + ~1 MB (shared — loaded once)
+  react-router-dom (shared):   ~50 KB
+  auth-context (shared):       ~30 KB (OAuth2 PKCE logic)
+  feature-flags (shared):      ~20 KB (LaunchDarkly client)
+  design-system (tree-shaken):  ~80 KB (only used atoms)
+  shell bundle (nav + routing): ~40 KB
+  ─────────────────────────────────────
+  Total initial:               ~1.35 MB (TTI target < 2.5s on 4G)
+
+Per-page additions:
+  dashboard bundle:            ~250 KB (Recharts tree-shaken)
+  payments bundle:             ~300 KB (form logic, validation)
+  trading bundle:              ~500 KB (D3 + virtualisation)  ← lazy-loaded only on /trading
+  compliance bundle:           ~200 KB (document upload)
+
+Performance budget rule:
+  Trading MFE's D3 dependency MUST be lazy-loaded within the MFE.
+  No single MFE bundle > 600 KB gzipped.
+  LCP must remain < 2.5s even on cached return visits.
+```
+
+---
+
+## 7. Architecture Decision Records (ADRs)
+
+### ADR-001: Module Federation over Iframes for MFE Integration (with PCI-DSS exception)
+
+**Decision:** Use Module Federation for all MFE integration except the PCI card capture flow, which uses a cross-origin iframe.
+
+**Rationale:** Module Federation provides shared React singleton (no duplicate hook errors), unified routing (single BrowserRouter), and shared auth context (single access token instance). Iframes are reserved exclusively for the PCI card capture boundary where JS isolation is a hard regulatory requirement — Module Federation components share the same JS heap and cannot provide the PAN data isolation required by PCI-DSS.
+
+---
+
+### ADR-002: Design System as npm Package, Not Module Federation Remote
+
+**Decision:** `@fintechbank/design-system` is published to a private npm registry and consumed as a build-time dependency. It is NOT exposed as a Module Federation remote.
+
+**Alternatives considered:**
+- **Module Federation remote** — components would be fetched at runtime and shared as singletons. Rejected: runtime visual regressions are harder to detect; design system bugs surface in production without prior visual regression gate.
+- **npm package (chosen)** — each MFE bundles the design system components it uses (tree-shaken). Storybook interaction tests and Chromatic visual regression run before publish. Design system bugs never reach production without a PR approval.
+
+**Consequence:** Design system updates require each MFE to bump its npm dependency and redeploy. Renovate bot automates this for patch/minor releases.
+
+---
+
+### ADR-003: access_token in React Context Memory, refresh_token in httpOnly Cookie
+
+**Decision:** Store the OAuth2 access_token exclusively in React context memory. Store the refresh_token in an httpOnly, SameSite=Strict, Secure cookie.
+
+**Consequence:** Refreshing the page triggers silent token refresh via the httpOnly refresh cookie (the browser sends it automatically to the auth server). The access_token is never persisted beyond the page session.
+
+**Rationale:** localStorage is accessible via any JavaScript — a single XSS payload can exfiltrate tokens and hijack sessions. httpOnly cookies are invisible to JavaScript. Memory storage for the access_token means it's gone on refresh (acceptable — silent refresh recovers it within ~500ms).
+
+---
+
+### ADR-004: Canary Deployment over Big-Bang for Regulated Changes
+
+**Decision:** All Payments and Trading MFE deployments use a canary traffic split (5% → 25% → 100%) with automated metric gates before promotion.
+
+**Rationale:** A broken payment form in a big-bang deployment affects all users simultaneously — a P0 incident in a regulated environment with mandatory CASS/FCA incident reporting obligations. A canary limits blast radius to 5% of users and can be rolled back within seconds (remoteEntry.js pointer swap).
+
+---
+
+### ADR-005: Accessibility Score 100 as Hard CI Gate
+
+**Decision:** Lighthouse CI accessibility score must be 100/100 on every PR. axe-core violations in any component story are a hard CI failure.
+
+**Consequence:** Features with inaccessible UI cannot be merged. Teams must implement accessible components from the first iteration.
+
+**Rationale:** The European Accessibility Act (EAA) applied to financial services from June 2025. A post-hoc accessibility remediation programme across a multi-team MFE platform would cost significantly more than enforcing correctness at the component level from day zero.
+
+---
+
+*Generated 2026-03-06 · Principal Front-End Solution Architect · Principal Front-End Quality Engineer · Digital Banking & Wealth Platform (React 18 · Webpack Module Federation · Storybook 8 · TypeScript · Tailwind CSS · OAuth2 PKCE · PCI-DSS · WCAG 2.1 AA)*
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
