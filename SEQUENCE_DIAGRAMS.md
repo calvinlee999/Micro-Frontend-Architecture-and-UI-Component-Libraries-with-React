@@ -67,14 +67,14 @@ sequenceDiagram
     activate AuthProvider
     AuthProvider->>AuthProvider: access_token = null — no session in memory
     AuthProvider->>IdP: redirect to /authorize?response_type=code&code_challenge=...
-    Note over AuthProvider,IdP: PKCE — code_verifier generated in JS; code_challenge = BASE64URL(SHA-256(code_verifier))
+    Note over AuthProvider,IdP: PKCE — code_verifier in JS, code_challenge = BASE64URL(SHA-256(code_verifier))
 
     User->>IdP: enters username + password + TOTP
     IdP-->>AuthProvider: redirect back to /callback?code=AUTH_CODE
 
     AuthProvider->>IdP: POST /token { code, code_verifier, client_id }
     IdP-->>AuthProvider: { access_token (15 min TTL), id_token, set-cookie: refresh_token (httpOnly) }
-    Note over AuthProvider,IdP: access_token in memory only (never localStorage); refresh_token = httpOnly SameSite=Strict cookie
+    Note over AuthProvider,IdP: access_token in memory only (never localStorage), refresh_token via httpOnly SameSite=Strict cookie
 
     AuthProvider->>AuthCtx: setAuthState({ user, access_token, roles: ["customer"] })
     deactivate AuthProvider
@@ -302,7 +302,7 @@ sequenceDiagram
     activate PaymentsMFE
     PaymentsMFE->>PaymentsMFE: import { CurrencyInput } from "@fintechbank/design-system"
     PaymentsMFE->>PaymentsMFE: webpack build — tree-shake design-system bundle
-    Note over PaymentsMFE: CurrencyInput included; KYCDocumentCard tree-shaken (unused organism)
+    Note over PaymentsMFE: CurrencyInput included, KYCDocumentCard tree-shaken (unused organism)
     PaymentsMFE-->>PaymentsTeam: build complete — new remoteEntry.js deployed
     deactivate PaymentsMFE
 
@@ -358,7 +358,7 @@ sequenceDiagram
 
     PaymentsApp->>PaymentsApp: render <PCIFrame src="https://pci.fintechbank.com/capture" />
     activate PCIFrame
-    Note over PaymentsApp,PCIFrame: Cross-origin iframe — JS cannot inspect DOM; card data never enters app heap
+    Note over PaymentsApp,PCIFrame: Cross-origin iframe — JS cannot inspect DOM, card data never enters app heap
 
     PaymentsApp-->>User: PCI card capture form visible inside iframe
 
@@ -679,7 +679,7 @@ sequenceDiagram
 
         Dev->>StorybookTest: storybook test (CI mode)
         StorybookTest->>StorybookTest: run play() on CurrencyInput, PaymentForm, KYCDocumentCard
-        Note over StorybookTest: play() — real Playwright in CI; userEvent.type + userEvent.click assert DOM state
+        Note over StorybookTest: play() — real Playwright in Storybook CI, userEvent.type and userEvent.click assert DOM state
         StorybookTest-->>Dev: ✅ interaction tests passed
 
         StorybookTest->>AxeCore: axe-core scan all stories
@@ -1539,7 +1539,7 @@ sequenceDiagram
 
     CI->>CDN: upload dist/listing.[NEW_HASH].js (Cache-Control: max-age=31536000,immutable)
     CI->>CDN: upload dist/remoteEntry.js (Cache-Control: no-cache)
-    Note over CI,CDN: remoteEntry.js must be no-cache (version manifest); listing.[HASH].js is immutable (hash changes on rebuild)
+    Note over CI,CDN: remoteEntry.js must be no-cache (version manifest), listing.[HASH].js is immutable (hash changes on rebuild)
 
     CDN-->>CI: assets deployed ✅
     deactivate CI
