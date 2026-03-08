@@ -342,14 +342,8 @@ sequenceDiagram
     PCIVault-->>PaymentsApp: { paymentToken: "pm_secure_token_xyz", vaultReference }
     deactivate PCIVault
 
-    PaymentsApp->>AuditMonitor: logComplianceEvent({ 
-        event: "HIGH_VALUE_PAYMENT_COMPLIANCE_VALIDATED",
-        user,
-        amount: "£50,000",
-        complianceChecks: ["PCI_DSS_L1", "SOC_2", "MIFID_II", "BASEL_III"],
-        encryptionApplied: true,
-        tokenized: true
-    })
+    PaymentsApp->>AuditMonitor: logComplianceEvent(HIGH_VALUE_PAYMENT_COMPLIANCE_VALIDATED)
+    Note over AuditMonitor: user, amount £50000, checks: PCI_DSS_L1+SOC_2+MIFID_II+BASEL_III, encryptionApplied: true, tokenized: true
     activate AuditMonitor
     AuditMonitor->>RegulatoryAPI: dispatchRegulatoryEvent(complianceEvent)
     RegulatoryAPI-->>AuditMonitor: regulatory event logged
@@ -422,23 +416,14 @@ sequenceDiagram
     RealtimeSync->>TradingBackend: WebSocket message: { type: "PLACE_ORDER", payload: orderData }
     
     TradingBackend->>TradingBackend: validate order, check buying power, execute against market
-    TradingBackend-->>RealtimeSync: WebSocket response: { 
-        type: "ORDER_CONFIRMED", 
-        orderId: "ORD-789456", 
-        status: "EXECUTED", 
-        executionPrice: 185.48,
-        timestamp: "2026-03-08T15:42:33.123Z" 
-    }
+    TradingBackend-->>RealtimeSync: WebSocket ORDER_CONFIRMED — orderId ORD-789456, EXECUTED @ 185.48, ts 2026-03-08T15:42:33Z
     deactivate RealtimeSync
 
     RealtimeSync->>ConflictResolver: reconcileStateUpdate(serverResponse, optimisticState)
     activate ConflictResolver
     ConflictResolver->>ConflictResolver: compare optimistic vs actual execution
     ConflictResolver->>ConflictResolver: detect price difference: optimistic $185.50 vs actual $185.48
-    ConflictResolver->>StateManager: updateTradingState({ 
-        orders: [replaceOptimistic(optimisticOrder, confirmedOrder)],
-        executionDelta: { priceImprovement: +0.02 }
-    })
+    ConflictResolver->>StateManager: updateTradingState — replaceOptimistic with confirmedOrder, priceImprovement +0.02
     ConflictResolver-->>RealtimeSync: conflict resolved — state synchronized
     deactivate ConflictResolver
 
@@ -448,13 +433,7 @@ sequenceDiagram
     PerformanceTracker->>PerformanceTracker: measure execution time: 32ms ✅ (under 50ms target)
     PerformanceTracker-->>EnterpriseState: performance metrics recorded
 
-    EnterpriseState->>AuditTrail: logStateTransition({
-        event: "TRADING_ORDER_STATE_TRANSITION",
-        fromState: "OPTIMISTIC_PENDING",
-        toState: "EXECUTION_CONFIRMED", 
-        executionTime: "32ms",
-        priceImprovement: "$0.02"
-    })
+    EnterpriseState->>AuditTrail: logStateTransition(TRADING_ORDER_STATE_TRANSITION, OPTIMISTIC_PENDING to EXECUTION_CONFIRMED, 32ms, priceImprovement $0.02)
 
     deactivate EnterpriseState
 
