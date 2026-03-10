@@ -312,10 +312,10 @@ flowchart TB
 
     subgraph ACCT_SVC["account-service — :8081"]
         subgraph WEB["Web Layer — @RestController"]
-            AE1["GET /api/accounts/{id}\ngetAccount()"]
-            AE2["GET /api/accounts/{id}/balance\ngetBalance() — Redis cache"]
-            AE3["GET /api/accounts/{id}/transactions\nlistTransactions() — JPA Spec"]
-            AE4["POST /api/accounts/{id}/limits\nupdateLimit()"]
+            AE1["GET /api/accounts/:id\ngetAccount()"]
+            AE2["GET /api/accounts/:id/balance\ngetBalance() — Redis cache"]
+            AE3["GET /api/accounts/:id/transactions\nlistTransactions() — JPA Spec"]
+            AE4["POST /api/accounts/:id/limits\nupdateLimit()"]
         end
         subgraph SVC["Service Layer — @Service @Transactional"]
             AS["AccountService\nCRUD · balance computation\ncache invalidation"]
@@ -332,7 +332,7 @@ flowchart TB
         end
     end
 
-    CACHE["Redis 7\naccount:balance:{id}\nTTL: 30s"]
+    CACHE["Redis 7\naccount:balance:[id]\nTTL: 30s"]
     DB["PostgreSQL\naccount-db"]
 
     GW --> AE1 & AE2 & AE3 & AE4
@@ -413,8 +413,8 @@ flowchart TB
     subgraph PMT_SVC["payment-service — :8082 (PCI-DSS scope)"]
         subgraph WEB["Web Layer"]
             PE1["POST /api/payments\ninitiatePayment()"]
-            PE2["GET /api/payments/{id}\ngetPaymentStatus()"]
-            PE3["POST /api/payments/{id}/cancel\ncancelPayment()"]
+            PE2["GET /api/payments/:id\ngetPaymentStatus()"]
+            PE3["POST /api/payments/:id/cancel\ncancelPayment()"]
         end
         subgraph SVC["Service Layer @Transactional"]
             PS["PaymentService\nState machine orchestration\nFraud pre-check\nKafka event emission"]
@@ -1085,7 +1085,7 @@ graph TB
     CEP_FN --> SINK_K
     CEP_FN --> SINK_LBQ
     SINK_K --> KT3
-    SINK_LBQ -->|"put() blocks sink thread\nwhen full → back-pressure"| LBQ
+    SINK_LBQ -->|"put() — back-pressure when full"| LBQ
     LBQ --> DRAIN
     DRAIN -->|"drainTo() non-blocking"| VT
     VT --> SVC
@@ -7276,12 +7276,12 @@ flowchart TB
     end
 
     subgraph READ_STORE["Read Store (Query Projections)"]
-        REDIS["Redis 7\npayment:status:{id} TTL 30 s\naccount:balance:read:{id} TTL 30 s\nportfolio:value:{id} TTL 10 s"]
+        REDIS["Redis 7\npayment:status:[id] TTL 30 s\naccount:balance:read:[id] TTL 30 s\nportfolio:value:[id] TTL 10 s"]
         PG_REPLICA["PostgreSQL Read Replica\nlag ≤ 50 ms · covering indexes"]
     end
 
-    CLIENT -->|POST /api/payments\nPOST /api/orders| CB
-    CLIENT -->|GET /api/payments/{id}\nGET /api/portfolio/{id}| QB
+    CLIENT -->|POST /api/payments · POST /api/orders| CB
+    CLIENT -->|GET /api/payments/:id · GET /api/portfolio/:id| QB
     CB --> CPH & CTH & CAH
     CPH & CTH & CAH --> PG_PRIMARY
     PG_PRIMARY --> OUTBOX
