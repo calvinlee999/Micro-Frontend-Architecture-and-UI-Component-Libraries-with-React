@@ -4416,6 +4416,8 @@ jobs:
 
 ## 9. Testing Strategy
 
+> Dedicated quality architecture reference: [QUALITY_MANAGEMENT_AUTOMATION_PERFORMANCE_TESTING.md](./QUALITY_MANAGEMENT_AUTOMATION_PERFORMANCE_TESTING.md)
+
 ### 9.0 Testing Pyramid
 
 ```
